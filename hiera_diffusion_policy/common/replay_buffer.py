@@ -258,15 +258,15 @@ class ReplayBuffer:
         for key, value in data.items():
             assert(len(value.shape) >= 1)
             if episode_length is None:
-                episode_length = len(value)
+                episode_length = len(value)     ## 新加的长度= T_raw - Tr
             else:
                 assert(episode_length == len(value))
         new_len = curr_len + episode_length
 
-        for key, value in data.items():
+        for key, value in data.items():         ##data.items：'pcd'，'state'，'action'，'next_pcd'，...
             new_shape = (new_len,) + value.shape[1:]
             # create array
-            if key not in self.data:
+            if key not in self.data:            ##replay_buffer.data：'state'，'action'
                 # copy data to prevent modify
                 arr = np.zeros(shape=new_shape, dtype=value.dtype)
                 self.data[key] = arr
@@ -275,10 +275,10 @@ class ReplayBuffer:
                 assert(value.shape[1:] == arr.shape[1:])
                 # same method for both zarr and numpy
                 arr.resize(new_shape, refcheck=False)
-            # copy data
+            # copy data                      ##加新的data值(在对应的key)
             arr[-value.shape[0]:] = value
         
-        # append to episode ends
+        # append to episode ends        ##episode_ends 轨迹结束时所处的步数= [T0, T0+T1, T0+T1+T2]
         episode_ends = self.episode_ends
         episode_ends.resize(episode_ends.shape[0] + 1, refcheck=False)
         episode_ends[-1] = new_len

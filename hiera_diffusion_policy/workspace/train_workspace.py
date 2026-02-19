@@ -106,27 +106,27 @@ class TrainWorkspace(BaseWorkspace):
 
         # configure dataset
         # ************ 数据集 ************
-        dataset = hydra.utils.instantiate(cfg.task.dataset)
-        train_dataloader = DataLoader(dataset, **cfg.dataloader)
+        dataset = hydra.utils.instantiate(cfg.task.dataset)         ##data转成标准格式 并抽出所有可用窗口（窗口长度horizon）
+        train_dataloader = DataLoader(dataset, **cfg.dataloader)    ##抽一batch的data窗口，叠成一个 batch dict
         train_dataloader_noshuff = DataLoader(dataset, **cfg.dataloader_noshuff)
-        normalizer = dataset.get_normalizer()   # 归一化
-        self.model.set_normalizer(normalizer)
+        normalizer = dataset.get_normalizer()   # 归一化    ##数据   ##state/action？：[-1, 1] 量级，其他？
+        self.model.set_normalizer(normalizer)   #模型 计算时要归一化，送给环境时返归一化
 
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
 
-        # configure lr scheduler
-        # ************ 设置 lr scheduler ************
+        # configure lr scheduler            ##学习率调度器：按step（batch）改 optimizer 里的 lr 值
+        # ************ 设置 lr scheduler ************   
         # pytorch assumes stepping LRScheduler every epoch
-        # however huggingface diffusers steps it every batch
+        # however huggingface diffusers steps it every batch    ##1 step = 1 个 batch，也是lr_scheduler.step() 的次数
         lr_scheduler_guider = get_scheduler(
-            cfg.training.lr_scheduler,
-            optimizer=self.optimizer_guider,
-            num_warmup_steps=cfg.training.lr_warmup_steps,
-            # num_training_steps=(len(train_dataloader) * cfg.training.num_epochs),
-            num_training_steps=cfg.training.num_steps,
-            last_epoch=self.global_step_guider-1
+            cfg.training.lr_scheduler,                  ##学习率随 step（batch） cosine变化
+            optimizer=self.optimizer_guider,            ##绑定 optimizer
+            num_warmup_steps=cfg.training.lr_warmup_steps,  ##慢慢“升温”到最大lr
+            # num_training_steps=(len(train_dataloader) * cfg.training.num_epochs), `##actor用 epoch 驱动，也是计算总step（batch）数
+            num_training_steps=cfg.training.num_steps,                      ##guider / critic用 global_step/ num_steps 驱动
+            last_epoch=self.global_step_guider-1        ##断点续训：last_epoch = -1 → 从头开始；last_epoch = k-1 → 下一次 step() 时当作第 k 步
         )
         lr_scheduler_critic = get_scheduler(
             cfg.training.lr_scheduler,
@@ -145,7 +145,7 @@ class TrainWorkspace(BaseWorkspace):
         )
 
         # configure env runner
-        # ************ 设置任务的仿真环境 ************
+        # ************ 设置任务的仿真环境 ************  ##用于评估（仅在actor训练时rollout），每隔 rollout_every 会跑一次
         # if cfg.test_run:
         #     cfg.task.env_runner.n_envs = 1
         if cfg.train_model == 'actor':
@@ -173,20 +173,20 @@ class TrainWorkspace(BaseWorkspace):
         # )
 
         # device transfer
-        # ************ 迁移到指定设备 ************
+        # ************ 迁移到指定设备 ************  ##模型 self.model和 optimizer放到device
         device = torch.device(cfg.training.device)
         self.model.to(device)
         optimizer_to(self.optimizer_guider, device)
         optimizer_to(self.optimizer_actor, device)
         optimizer_to(self.optimizer_critic, device)
 
-        # ************ 在数据集中测试guider ************
+        # ************ 在数据集中测试guider ************    ##调试用
         if cfg.test_guider:
             for batch_idx, batch in enumerate(train_dataloader_noshuff):
                 self.model.test_critic(batch)
                 # self.model.test_guider(batch)
 
-        # ************ 在仿真环境中测试hdp ************
+        # ************ 在仿真环境中测试hdp ************     ##不训练，在仿真环境跑 policy 并退出
         if cfg.test_run:
             runner_log = env_runner.run(self.model, first=True)
             runner_log = env_runner.run(self.model)
@@ -210,11 +210,17 @@ class TrainWorkspace(BaseWorkspace):
                     # ************ train for this epoch ************
                     train_losses_subgoal = list()
                     with tqdm.tqdm(train_dataloader, desc=f"Training Guider - epoch {self.epoch_guider}", 
-                            leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
-                        for batch_idx, batch in enumerate(tepoch):
-                            # device transfer
+                            leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:     ##循环对象tepoch=进度条包装循环对象train_dataloadertepoch
+                        for batch_idx, batch in enumerate(tepoch):                              ##遍历tepoch即train_dataloader，一次生成一batch（内部是真实值）和 所在第几个batch
+                            ## batch = {
+                            ##     'pcd':   torch.Tensor shape (B, obs_hist, 1024, 3),
+                            ##     'state': torch.Tensor shape (B, obs_hist, S),
+                            ##     'action': ...
+                            ##     ...
+                            ##     }
+                            # device transfer ##把DataLoader / Dataset 默认产出的 tensor从cpu->device
                             batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                            if train_sampling_batch is None:
+                            if train_sampling_batch is None:            ## 缓存第一个 epoch 的第一个 batch的数据
                                 train_sampling_batch = batch
 
                             # optimize guider
@@ -226,8 +232,8 @@ class TrainWorkspace(BaseWorkspace):
                             lr_scheduler_guider.step()
                             
                             # logging
-                            loss_subgoal = raw_loss_subgoal.item()
-                            tepoch.set_postfix(loss=loss_subgoal, refresh=False)
+                            loss_subgoal = raw_loss_subgoal.item()          ##取出里面的值
+                            tepoch.set_postfix(loss=loss_subgoal, refresh=False)    ##进度条
                             train_losses_subgoal.append(loss_subgoal)
                             
                             step_log = {
@@ -236,7 +242,7 @@ class TrainWorkspace(BaseWorkspace):
                                 'epoch_guider': self.epoch_guider,
                                 'lr_guider': lr_scheduler_guider.get_last_lr()[0]
                             }
-
+                                ##前面的batch正常记录 step_log，最后一个batch还要加东西
                             is_last_batch = (batch_idx == (len(train_dataloader)-1))
                             if not is_last_batch:
                                 # log of last step is combined with validation and rollout
@@ -261,20 +267,20 @@ class TrainWorkspace(BaseWorkspace):
                                 for batch_idx, batch in enumerate(tepoch):
                                     batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
                                     loss = self.model.compute_loss_guider(batch)
-                                    val_losses.append(loss)
+                                    val_losses.append(loss)                 ## 最好val_losses.append(loss.item())
                                     if (cfg.training.max_val_steps is not None) \
                                         and batch_idx >= (cfg.training.max_val_steps-1):
                                         break
-                            if len(val_losses) > 0:
+                            if len(val_losses) > 0:                         ## 再np.mean(val_losses)
                                 val_loss = torch.mean(torch.tensor(val_losses)).item()
                                 # log epoch average validation loss
                                 step_log['val_loss_subgoal'] = val_loss
 
                     # run diffusion sampling on a training batch
-                    # ************ 在一个训练batch上测试完整逆扩散过程的损失 ************
+                    # ************ 在一个训练batch上测试完整逆扩散过程的损失 ************##始终同一个batch，看不同epoch上这个batch的loss情况
                     if (self.epoch_guider % cfg.training.sample_every) == 0:
                         with torch.no_grad():
-                            batch = train_sampling_batch    # Tensor, no norm
+                            batch = train_sampling_batch    # Tensor, no norm   ##batch 是原始尺度
                             
                             pred_subgoal = self.model.predict_subgoal(batch)
                             target_subgoal = batch['subgoal'][:, :pred_subgoal.shape[1]]

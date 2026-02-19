@@ -117,13 +117,30 @@ class BaseWorkspace:
     def load_checkpoint_guider(self, guider_path):
         print('loading Guider:', guider_path)
         payload_guider = torch.load(guider_path.open('rb'), pickle_module=dill)
+        # payload字典= {
+        #             "cfg": <OmegaConf>,
+        #             "state_dicts": {      "model": model.state_dict(),
+        #                                   "ema_model": ema_model.state_dict(),
+        #                                   "optimizer": optimizer.state_dict(),... },
+        #             "pickles": {                                           # 仅包含 include_keys 指定的对象
+        #                                    "global_step": <int>,
+        #                                    "epoch": <int>,
+        #                                    "_output_dir": <str>,... }
+        #             }
+
+        # model或ema_model.state_dict() == {
+        #               "guider.fc1.weight": tensor(...),
+        #               "guider.fc1.bias": tensor(...),
+        #               "critic.fc1.weight": tensor(...),
+        #               ...
+        #           }
             
-        for key, value in payload_guider['state_dicts'].items():
-            if key == 'model' or key == 'ema_model':
-                model_dict =  self.__dict__[key].state_dict()
-                guider_params = {k:v for k, v in value.items() if k.startswith('guider')}
-                model_dict.update(guider_params)
-                self.__dict__[key].load_state_dict(model_dict)
+        for key, value in payload_guider['state_dicts'].items():    ##存储的：key：model或ema_model      value：model.state_dict()或 ema_model.state_dict()
+            if key == 'model' or key == 'ema_model':                ##model和ema_model同时更新
+                model_dict =  self.__dict__[key].state_dict()   ##模型的属性字典   self.__dict__['model']等价于 self.model
+                guider_params = {k:v for k, v in value.items() if k.startswith('guider')}       # 存储的：k："guider.fc1.weight" v：tensor(...)
+                model_dict.update(guider_params)    ##模型的：更新覆盖网络self.model.state_dict()的同名 k：v
+                self.__dict__[key].load_state_dict(model_dict) ##self.model.load_state_dict(): 把参数写回模型
     
     def load_checkpoint_AC(self, AC_path):
         print('loading AC:', AC_path)

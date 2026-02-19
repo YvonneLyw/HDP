@@ -48,7 +48,7 @@ class ConditionalResidualBlock1D(nn.Module):
         self.residual_conv = nn.Conv1d(in_channels, out_channels, 1) \
             if in_channels != out_channels else nn.Identity()
 
-    def forward(self, x, cond):
+    def forward(self, x, cond):         ##FiLM 风格（scale/bias 或直接加）把condition注入卷积特征noised_actions
         '''
             x : [ batch_size x in_channels x horizon ]
             cond : [ batch_size x cond_dim]
@@ -57,7 +57,7 @@ class ConditionalResidualBlock1D(nn.Module):
             out : [ batch_size x out_channels x horizon ]
         '''
         out = self.blocks[0](x) # (batch, out_channels, horizon)
-        embed = self.cond_encoder(cond) # (batch, cond_channels, 1)
+        embed = self.cond_encoder(cond) # (batch, cond_channels, 1)     ##cond(长度 cond_dim)线性投影成长度cond_channels的向量=2倍out_channels
         if self.cond_predict_scale:
             # FiLM
             embed = embed.reshape(
@@ -73,7 +73,7 @@ class ConditionalResidualBlock1D(nn.Module):
         return out
 
 
-class Actor(nn.Module):
+class Actor(nn.Module):     ##Actor 本质：条件 1D U-Net，任务是预测扩散噪声epsilon
     def __init__(
             self,
             diffusion_step_encoder: TimestepEncoder,
@@ -178,7 +178,7 @@ class Actor(nn.Module):
             timestep = timestep[None].to(state.device)
         timestep = timestep.expand(state.shape[0])
         
-        # ************** encode conditions **************
+        # ************** encode conditions **************       ## conditions 编码 拼接 --> global_feature
         timestep_emb = self.diffusion_step_encoder(timestep)    # (b, C1)
         
         cond = (timestep_emb, state)
@@ -191,19 +191,19 @@ class Actor(nn.Module):
         
         global_feature = torch.concat(cond, dim=1)
 
-        # ************** state/action **************
+        # ************** state/action **************    ##主干网络: 把action 变成 Conv1d 格式(B,H,C) -> (B,C,H)，走 U-Net，再变回 (B,H,C)噪声
         x = einops.rearrange(noised_actions, 'b h c -> b c h')
         # down module
         h = []
         for idx, (resnet, resnet2, downsample) in enumerate(self.down_modules):
-            x = resnet(x, global_feature)
+            x = resnet(x, global_feature)                   ## ConditionalResidualBlock1D: FiLM 风格（scale/bias 或直接加）把condition注入卷积特征noised_actions，再做残差输出。
             x = resnet2(x, global_feature)
             h.append(x)
             x = downsample(x)
         # mid module
         for mid_module in self.mid_modules:
             x = mid_module(x, global_feature)
-        # up module
+        # up module             ## +skip 连接
         for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):
             x = torch.cat((x, h.pop()), dim=1)
             x = resnet(x, global_feature)

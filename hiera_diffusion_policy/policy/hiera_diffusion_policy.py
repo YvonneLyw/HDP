@@ -222,17 +222,21 @@ class HieraDiffusionPolicy(BasePcdPolicy):
         #     action = action_init
         #     timesteps = range(10)[::-1]
         # else:
-        B = state.shape[0]
+        B = state.shape[0]              ## B：batch size（一次并行生成多少条A）
         shape = (B, self.horizon, self.action_dim)
-        action = torch.randn(size=shape, dtype=self.dtype, device=self.device)
-        timesteps = self.noise_scheduler_actor.timesteps
-
+        action = torch.randn(size=shape, dtype=self.dtype, device=self.device)     ##纯噪A_k
+        timesteps = self.noise_scheduler_actor.timesteps        ## scheduler 的时间步序列k[999, 998, ..., 0]
+            ## DP model逐步（k,k-1,...,0)反向去噪      
+            ## 输入：DP条件（观测/状态/子目标）+ 当前 noisy action：A_k + 当前扩散时间步：t（即k）
+            ## 同一个标量扩散时间步：t（即k） 作用于整个 batch
+            ## 输出action_noise：单步预测噪声epsilon（取决于 scheduler 配的 prediction_type）
         for t in timesteps:
             if model is None:
                 action_noise = self.actor_target(pcd, state, subgoal, action, t)
             else:
                 action_noise = model(pcd, state, subgoal, action, t)
-            # action
+            # action        ## 一步反推:x_k到x_k-1
+                            ## action_noise:单步预测噪声epsilon, t：时间步k, action：x_k
             action = self.noise_scheduler_actor.step(
                 action_noise, t, action, generator=None).prev_sample
         return action
@@ -369,15 +373,15 @@ class HieraDiffusionPolicy(BasePcdPolicy):
         B = nbatch['state'].shape[0]
 
         # ******** bc loss ********
-        # diffusion
+        # diffusion     ## （batchsize个样本）一次加噪（timesteps：batchsize 个随机 k）
         timesteps = torch.randint(
-            0, self.noise_scheduler_actor.config.num_train_timesteps, # 100
+            0, self.noise_scheduler_actor.config.num_train_timesteps, # 100     ##总步数K=100
             (B,), device=self.device
         ).long()
-        # add noise to action
+        # add noise to action   ## batch内不同样本 使用不同扩散时间步：t（即k）
         noise = torch.randn(nbatch['action'].shape, device=self.device)  # Sample noise
         noisy_action = self.noise_scheduler_actor.add_noise(nbatch['action'], noise, timesteps)
-        # pred
+        # pred      ## pred：单步预测噪声epsilon（batchsize 个）”
         pcd = None
         if self.use_pcd:
             pcd = nbatch['pcd'].transpose(1, 2).reshape(
@@ -386,16 +390,27 @@ class HieraDiffusionPolicy(BasePcdPolicy):
                 pcd = torch.concat((pcd, nbatch['pcd_id']), dim=-1)
         state = nbatch['state'].reshape((B, -1))  # (B, n*S)
         subgoal = nbatch['subgoal'] if 'subgoal' in nbatch else None
-        pred = self.actor(pcd, state, subgoal, noisy_action, timesteps)
+        pred = self.actor(pcd, state, subgoal, noisy_action, timesteps) ## actor网络：noisy_action+条件+时间步 -- u net -->预测噪声
         bc_loss = F.mse_loss(pred, noise)
         
         # ******** q loss ********
         if self.eta != 0:
             if self.single_step_reverse_diffusion:
-                # 单次逆扩散，由Xt直接生成X0
-                new_action_seq = self.noise_scheduler_actor.step_batch(
-                        pred, timesteps, noisy_action, generator=None
-                        ).pred_original_sample
+                # 单次逆扩散，由Xt直接生成X0    ## 一次性反推:x_k到x_0
+                ## batch内不同样本 使用不同扩散时间步：t（即k）
+                # new_action_seq = self.noise_scheduler_actor.step_batch(
+                #         pred, timesteps, noisy_action, generator=None
+                #         ).pred_original_sample
+                pred_x0_list = []
+                for i in range(B):
+                    step_output = self.noise_scheduler_actor.step(
+                        pred[i:i+1],
+                        int(timesteps[i].item()),
+                        noisy_action[i:i+1],
+                        generator=None
+                    )
+                    pred_x0_list.append(step_output.pred_original_sample)
+                new_action_seq = torch.cat(pred_x0_list, dim=0)
             else:
                 # 完整逆扩散
                 new_action_seq = self.conditional_sample_action(

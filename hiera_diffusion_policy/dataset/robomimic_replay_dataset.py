@@ -49,7 +49,7 @@ class RobomimicReplayDataset(BasePcdDataset):
         ):
         obs_keys = list(obs_keys)
         rotation_transformer = RotationTransformer(
-            from_rep='axis_angle', to_rep=rotation_rep)
+            from_rep='axis_angle', to_rep=rotation_rep)             ## -> action rotation_6d
 
         replay_buffer = ReplayBuffer.create_empty_numpy()
         with h5py.File(dataset_path) as file:
@@ -62,10 +62,10 @@ class RobomimicReplayDataset(BasePcdDataset):
 
             scene_pcd = demos['demo_0']['scene_pcd'][:].astype(np.float32)
             object_pcd = demos['demo_0']['object_pcd'][:].astype(np.float32)
-            # 遍历轨迹，获取 state / action
+            ## 遍历轨迹（每个 demo_i/episode），获取并整理episode data，连接所有episode塞进 ReplayBuffer
             for i in tqdm(range(len(demos)), desc="Loading hdf5 to ReplayBuffer"):
                 demo = demos[f'demo_{i}']
-                # get state / action
+                # get state / action    ##把原始 obs/actions 转成统一格式：data
                 data = _data_to_obs(
                     raw_obs=demo['obs'],
                     obj_pcd=object_pcd,
@@ -77,14 +77,14 @@ class RobomimicReplayDataset(BasePcdDataset):
                     Tr=Tr)
 
                 if use_subgoal:
-                    #! stage subgoal
+                    #! stage subgoal                               ## 4 Algorithms
                     subgoals = get_subgoals_stage_robomimic(
                         demo['obs'],
                         object_pcd,
                         fin_rad=0.008,
                         sim_thresh=[0.02, 10./180*np.pi],
                         reward_mode='only_success',
-                        Tr=Tr)
+                        Tr=Tr)                                    ##'subgoal'，'next_subgoal'，'reward'
                     #! realtime subgoal
                     # subgoals = get_subgoals_realtime_robomimic(
                     #     demo['obs'],
@@ -110,9 +110,9 @@ class RobomimicReplayDataset(BasePcdDataset):
             n_episodes=replay_buffer.n_episodes,
             val_ratio=val_ratio,
             seed=seed)
-        train_mask = ~val_mask
+        train_mask = ~val_mask      ##shape=(n_episodes,)  用于测试的episode为0，用于训练的为1
 
-        if max_train_episodes is not None:
+        if max_train_episodes is not None:  ##限制训练用的demo 数量，减少训练时间（可选）
             print(f'Use {max_train_episodes} demos to train!')
         else:
             print('Use all demos to train!')
@@ -120,7 +120,7 @@ class RobomimicReplayDataset(BasePcdDataset):
             mask=train_mask, 
             max_n=max_train_episodes, 
             seed=seed)
-
+        ##截取窗口
         sampler = SequenceSampler(
             replay_buffer=replay_buffer, 
             abs_action=abs_action,
@@ -238,7 +238,7 @@ def _data_to_obs(raw_obs, obj_pcd, scene_pcd, raw_actions, obs_keys, abs_action,
         `action`: (N, A) 其中的旋转分量转换成了rotation_6d，即连续的旋转表示
 
     """
-    # get finger pos
+    # get finger pos        ##gripper 信息fl_pos, fr_pos
     fs_pos = list()
     for step in range(raw_obs['object'].shape[0]):
         fl_pos, fr_pos = getFingersPos(
@@ -248,7 +248,7 @@ def _data_to_obs(raw_obs, obj_pcd, scene_pcd, raw_actions, obs_keys, abs_action,
             raw_obs['robot0_gripper_qpos'][step, 1]-0.0145/2,
             )
         fs_pos.append( np.concatenate((fl_pos, fr_pos), axis=0) )
-    
+    ##拼出来（obs_keys）的状态向量：['object'7, 'robot0_eef_pos'3, 'robot0_eef_quat'4]+左手指 xyz + 右手指 xyz
     obs = np.concatenate(
         [raw_obs[key] for key in obs_keys[:-1]] + [np.array(fs_pos),], 
         axis=-1).astype(np.float32)
@@ -263,7 +263,7 @@ def _data_to_obs(raw_obs, obj_pcd, scene_pcd, raw_actions, obs_keys, abs_action,
         pos = raw_actions[...,:3]
         rot = raw_actions[...,3:6]  
         gripper = raw_actions[...,6:]
-        rot = rotation_transformer.forward(rot)
+        rot = rotation_transformer.forward(rot)         ## -> action rotation_6d
         raw_actions = np.concatenate([
             pos, rot, gripper
         ], axis=-1).astype(np.float32)
@@ -271,17 +271,17 @@ def _data_to_obs(raw_obs, obj_pcd, scene_pcd, raw_actions, obs_keys, abs_action,
         if is_dual_arm:
             raw_actions = raw_actions.reshape(-1,20)
     
-    # 构建点云
+    # 构建点云 ##每步的obj点云（由 object_pcd 经过物体位姿变换得到
     obj_pcd_batch = np.expand_dims(obj_pcd, axis=0).repeat(obs.shape[0], axis=0)
     obj_pcd_state = tf.transPts_tq_npbatch(obj_pcd_batch, obs[:, :3], obs[:, 3:7])  # (N, 1024, 3)
     # scene_pcd_batch = np.expand_dims(scene_pcd, axis=0).repeat(obs.shape[0], axis=0)    # (N, 1024, 3)
     # pcd_state = np.concatenate((obj_pcd_state, scene_pcd_batch), axis=1)    # (N, 2048, 3)
 
     data = {
-        'pcd': obj_pcd_state[:-Tr],
-        'state': obs[:-Tr],
-        'action': raw_actions[:-Tr],
-
+        'pcd': obj_pcd_state[:-Tr],     ##每步的obj点云
+        'state': obs[:-Tr],             ##拼出来的状态向量：['object'7, 'robot0_eef_pos'3, 'robot0_eef_quat'4]+左手指 xyz + 右手指 xyz
+        'action': raw_actions[:-Tr],    ##动作（rotation_6d）
+        ##（通过 Tr 形成 (s_t, a_t) → (s_{t+Tr}, a_{t+Tr})）
         'next_pcd': obj_pcd_state[Tr:],
         'next_state': obs[Tr:],
         'next_action': raw_actions[Tr:],
