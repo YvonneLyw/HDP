@@ -1,0 +1,12 @@
+results_yuwei/
+
+data.tar.xz
+data/
+wandb/
+
+__pycache__/
+*.py[cod]
+
+
+
+*.log

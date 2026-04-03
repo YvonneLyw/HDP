@@ -78,7 +78,7 @@ class TrainWorkspace(BaseWorkspace):
         cfg = copy.deepcopy(self.cfg)
 
         # resume training
-        # ************ 加载模型权重 ************
+        # ************ 加载模型权重 ************    ## 从checkpoint里只挑出model相关的参数，塞回当前内存里的 model / ema_model 对象
         # if cfg.training.resume:
         #     lastest_ckpt_path = self.get_checkpoint_path()
         #     if lastest_ckpt_path.is_file():
@@ -106,7 +106,7 @@ class TrainWorkspace(BaseWorkspace):
 
         # configure dataset
         # ************ 数据集 ************
-        dataset = hydra.utils.instantiate(cfg.task.dataset)         ##data转成标准格式 并抽出所有可用窗口（窗口长度horizon）
+        dataset = hydra.utils.instantiate(cfg.task.dataset)         ##data转成标准格式 并抽出所有可用窗口（长度horizon）的切片索引
         train_dataloader = DataLoader(dataset, **cfg.dataloader)    ##抽一batch的data窗口，叠成一个 batch dict
         train_dataloader_noshuff = DataLoader(dataset, **cfg.dataloader_noshuff)
         normalizer = dataset.get_normalizer()   # 归一化    ##数据   ##state/action？：[-1, 1] 量级，其他？
@@ -210,7 +210,7 @@ class TrainWorkspace(BaseWorkspace):
                     # ************ train for this epoch ************
                     train_losses_subgoal = list()
                     with tqdm.tqdm(train_dataloader, desc=f"Training Guider - epoch {self.epoch_guider}", 
-                            leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:     ##循环对象tepoch=进度条包装循环对象train_dataloadertepoch
+                            leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:     ##循环对象tepoch=进度条包装循环对象train_dataloader
                         for batch_idx, batch in enumerate(tepoch):                              ##遍历tepoch即train_dataloader，一次生成一batch（内部是真实值）和 所在第几个batch
                             ## batch = {
                             ##     'pcd':   torch.Tensor shape (B, obs_hist, 1024, 3),
@@ -218,7 +218,8 @@ class TrainWorkspace(BaseWorkspace):
                             ##     'action': ...
                             ##     ...
                             ##     }
-                            # device transfer ##把DataLoader / Dataset 默认产出的 tensor从cpu->device
+
+                            # device transfer   ##把DataLoader / Dataset 默认产出的 tensor从cpu->device
                             batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
                             if train_sampling_batch is None:            ## 缓存第一个 epoch 的第一个 batch的数据
                                 train_sampling_batch = batch

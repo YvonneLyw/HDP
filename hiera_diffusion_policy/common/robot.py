@@ -404,9 +404,9 @@ def get_subgoals_realtime_nonprehensile(
         - reward_mode (str): 'only_success' or 'tanh'
 
     return:
-        - subgoal: (N-1, 8) 对应每个state的子目标 手指位置(世界坐标系)/是否接触, 不接触的手指子目标位置全为0
-        - next_subgoal: (N-1, 8) 对应下一个state的子目标 手指位置(世界坐标系)/是否接触, 不接触的手指子目标位置全为0
-        - reward: (N-1,)
+        - subgoal: (N - Tr, 8) 对应每个state的子目标 手指位置(世界坐标系)/是否接触, 不接触的手指子目标位置全为0
+        - next_subgoal: (N - Tr, 8) 对应下一个state的子目标 手指位置(世界坐标系)/是否接触, 不接触的手指子目标位置全为0
+        - reward: (N - Tr,)
     """
 
     # ********** 记录接触位置 **********
@@ -531,9 +531,9 @@ def get_subgoals_stage_robomimic(
         - reward_mode (str): 'only_success' or 'tanh'
 
     return:
-        - subgoal: (N-1, 8) 对应每个state的子目标 手指位置(世界坐标系)/是否接触, 不接触的手指子目标位置全为0
-        - next_subgoal: (N-1, 8) 对应下一个state的子目标 手指位置(世界坐标系)/是否接触, 不接触的手指子目标位置全为0
-        - reward: (N-1,)
+        - subgoal: (N - Tr, 8) 对应每个state的子目标 手指位置(世界坐标系)/是否接触, 不接触的手指子目标位置全为0
+        - next_subgoal: (N - Tr, 8) 对应下一个state的子目标 手指位置(世界坐标系)/是否接触, 不接触的手指子目标位置全为0
+        - reward: (N - Tr,)
     """
     
 
@@ -579,7 +579,7 @@ def get_subgoals_stage_robomimic(
 
         is_fl_contact = fl_dist < contact_thresh
         is_fr_contact = fr_dist < contact_thresh
-        # 记录手指接触位置
+        # 记录手指接触位置                      ## 左右pos(fl_sg，fr_sg)& 接触flag
         fin_subgoals_obj_init.append(
             np.concatenate((fl_pos_obj, fr_pos_obj, [is_fl_contact,], [is_fr_contact,])))
         # 记录物体位姿
@@ -654,10 +654,10 @@ def get_subgoals_stage_robomimic(
         fin_sg_id = max(obj_subgoals_id[obj_sg_id], step)
         fin_sg = fin_subgoals_obj_init[fin_sg_id]
 
-        # 记录世界坐标下的当前时刻的子目标
+        # 记录世界坐标下的当前时刻的子目标                  ##mask：不接触则为（000）目标
         fl_sg = tf.transPt(fin_sg[:3], t_f2_f1=obj_pos, q_f2_f1=obj_qua) * fin_sg[6]
         fr_sg = tf.transPt(fin_sg[3:6], t_f2_f1=obj_pos, q_f2_f1=obj_qua) * fin_sg[7]
-        fin_sgs.append(np.concatenate((fl_sg, fr_sg, [fin_sg[6],], [fin_sg[7],])))        
+        fin_sgs.append(np.concatenate((fl_sg, fr_sg, [fin_sg[6],], [fin_sg[7],])))        ##拼接
         # 记录下一时刻的子目标
         next_obj_pos = raw_obs['object'][step+Tr, :3]
         next_obj_qua = raw_obs['object'][step+Tr, 3:7]

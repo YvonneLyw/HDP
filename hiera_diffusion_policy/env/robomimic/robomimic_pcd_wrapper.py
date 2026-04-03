@@ -41,9 +41,9 @@ class RobomimicPcdWrapper(gym.Env):
             'robot0_eef_pos', 
             'robot0_eef_quat', 
             'robot0_gripper_qpos'],
-        init_state: Optional[np.ndarray]=None,
-        render_hw=(256,256),
-        render_camera_name='agentview'
+        init_state: Optional[np.ndarray]=None,          ## 如果不为空，reset 时固定到这个状态
+        render_hw=(256,256),                            ## 渲染图像大小 (128,128)
+        render_camera_name='agentview'                  ## 用哪个相机视角渲染
         ):
 
         self.env = env
@@ -51,11 +51,11 @@ class RobomimicPcdWrapper(gym.Env):
         self.init_state = init_state
         self.render_hw = render_hw
         self.render_camera_name = render_camera_name
-        self.seed_state_map = dict()
-        self._seed = None
+        self.seed_state_map = dict()                    ## 缓存“seed 对应的初始状态”
+        self._seed = None                               ## 下次 reset 要使用的 seed
         
-        # setup spaces
-        low = np.full(env.action_dimension, fill_value=-1)
+        # setup spaces      ## 环境action space设置成标准 gym.spaces.Box：dim：env.action_dimension，每一维范围 [-1, 1]
+        low = np.full(env.action_dimension, fill_value=-1)      ## env.action_dimension：从底层robomimic环境获取，最初是从demo的env_meta（中的controller配置）定义环境
         high = np.full(env.action_dimension, fill_value=1)
         self.action_space = Box(
             low=low,
@@ -63,12 +63,12 @@ class RobomimicPcdWrapper(gym.Env):
             shape=low.shape,
             dtype=low.dtype
         )
-        obs_example = self.get_observation()
+        obs_example = self.get_observation()     ## 真的去引擎拿一份 observation 样本（并整理）， 设置 observation space
         low = np.full_like(obs_example, fill_value=-1)
         high = np.full_like(obs_example, fill_value=1)
         # 在Nonprehensile任务中，改成维度为包括 object pose/gripper pose/finger position
         self.observation_space = Box(
-            low=low,
+            low=low,          ## 不一定真实状态归一化到[-1,1]
             high=high,
             shape=low.shape,
             dtype=low.dtype
@@ -78,27 +78,26 @@ class RobomimicPcdWrapper(gym.Env):
         return self.env.pcd_goal()
 
 
-    def get_observation(self):
+    def get_observation(self):      ## 获取obs = [object, eef_pos, eef_quat, fl_pos, fr_pos]
         """
         获取flatten的观测数据
         """
         raw_obs = self.env.get_observation()
-        obs = updateState(raw_obs, self.obs_keys)
+        obs = updateState(raw_obs, self.obs_keys)       ## 将 robot0_gripper_qpos 替换为 finger pos
         return obs
 
-    def seed(self, seed=None):
+    def seed(self, seed=None):     ## 设置 numpy 随机种子, 把 seed 暂存在 self._seed, 真正使用是在下一次 reset()
         np.random.seed(seed=seed)
         self._seed = seed
     
     def reset(self):
-        if self.init_state is not None:
-            # always reset to the same state
-            # to be compatible with gym
+        if self.init_state is not None:     ## 按固定 init_state reset, 每次 rollout 从完全相同状态开始
+            # always reset to the same state to be compatible with gym
             self.env.reset_to({'states': self.init_state})
-        elif self._seed is not None:
+        elif self._seed is not None:        ## 按 seed reset
             # reset to a specific seed
             seed = self._seed
-            if seed in self.seed_state_map:
+            if seed in self.seed_state_map:     ##若此seed已经生成过一个初始状态，直接恢复缓存初始状态
                 # env.reset is expensive, use cache
                 self.env.reset_to({'states': self.seed_state_map[seed]})
             else:
@@ -113,13 +112,13 @@ class RobomimicPcdWrapper(gym.Env):
             self.env.reset()
 
         # return obs
-        obs = self.get_observation()
+        obs = self.get_observation()    ## 获取obs = [object, eef_pos, eef_quat, fl_pos, fr_pos]
         return obs
     
-    def step(self, action):
+    def step(self, action):     ## 执行一步 action
         raw_obs, reward, done, info = self.env.step(action)
 
-        obs = updateState(raw_obs, self.obs_keys)
+        obs = updateState(raw_obs, self.obs_keys)       ##obs = [object, eef_pos, eef_quat, fl_pos, fr_pos]
         return obs, reward, done, info
     
     def render(self, mode='rgb_array'):

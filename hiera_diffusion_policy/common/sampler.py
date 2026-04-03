@@ -48,24 +48,25 @@ def create_indices(
         - sample_start_idx: 样本在episode中的起始索引，最小值为-pad_before，最大值为(episode_length + pad_after - sequence_length)
         - sample_end_idx:   样本在episode中的结束索引，等于 (start_idx+sequence_length-1)
     """
+    ## pad_before 和 pad_after 必须>0 且 <sequence_length-1=15, 否则会有窗口里全是pad，没有一个真实数据
     pad_before = min(max(pad_before, 0), sequence_length-1)
     pad_after = min(max(pad_after, 0), sequence_length-1)
 
     indices = list()
-    for i in range(len(episode_ends)):
+    for i in range(len(episode_ends)):              ## demo_i的循环
         if not episode_mask[i]:
             # skip episode
             continue
-        episode_start_idx = 0
+        episode_start_idx = 0        ##  episode_start_idx 到 episode_end_idx 是当前demo_i的data的索引范围
         if i > 0:
             episode_start_idx = episode_ends[i-1]
         episode_end_idx = episode_ends[i]-1
-        episode_length = episode_end_idx - episode_start_idx + 1
+        episode_length = episode_end_idx - episode_start_idx + 1        ## episode_length一般就是N
         
         # start_idx在[min, max]之间时，action序列前后需要填充pad的数量才不会超过设定值
-        min_start_idx = -pad_before
+        min_start_idx = -pad_before ## 窗口头的最大最小 范围[-pad_before,demo长N+pad_after-窗口长]
         max_start_idx = episode_length + pad_after - sequence_length
-        for idx in range(min_start_idx, max_start_idx+1):
+        for idx in range(min_start_idx, max_start_idx+1):       ##python取值不含最末
             sample_start_idx = idx
             sample_end_idx = sample_start_idx + sequence_length - 1
             indices.append([i, episode_length, sample_start_idx, sample_end_idx])
@@ -105,7 +106,7 @@ class SequenceSampler:
     def __len__(self):
         return len(self.indices)
         
-    def sample_sequence(self, idx):
+    def sample_sequence(self, idx):     ##使用窗口索引切片self.indices[idx]去切replay_buffer里的实值
         """
         获取输入网络的原始数据
         
@@ -124,6 +125,7 @@ class SequenceSampler:
                     )
                 )
         """
+        ## self.indices, episode_idx, episode_length, start_idx, end_idx 的shape： (窗口总数, )
         episode_idx, episode_length, start_idx, end_idx = self.indices[idx]
         result = {
             'meta': dict(),
@@ -133,21 +135,24 @@ class SequenceSampler:
             result['meta'][key] = np.array(self.replay_buffer.meta[key][episode_idx])
             
         for key in self.data_keys:
-            if episode_idx == 0:
+            if episode_idx == 0:                ## （窗口0：demo 在 replay buffer 里的全局起始位置， 窗口1, 2...）
                 episode_start_idx = 0
             else:
                 episode_start_idx = self.replay_buffer.meta['episode_ends'][episode_idx-1]
 
-            # state / action
+            # state / action                    ## data：(窗口0：切出来当前 demo 的整段数据,  窗口1, 2...）
             data = self.replay_buffer.data[key][episode_start_idx:
                                                 self.replay_buffer.meta['episode_ends'][episode_idx]]
+            
             # 获取action索引范围：start_idx -> 0 -> episode_length-1 -> end_idx
+            ## 窗口长度L = sample_after_idx - sample_start_idx + 1（还没 pad，1 <= L <= sequence_length）
             pad_before_num = max(0-start_idx, 0)
             sample_start_idx = max(start_idx, 0)
             pad_after_num = max(end_idx - (episode_length-1), 0)
             sample_after_idx = min(end_idx, episode_length-1)
-            # 原始数据
+            # 原始数据                           ## sample切：（窗口0：窗口实际值， 窗口1, 2... ）
             sample = data[sample_start_idx: sample_after_idx+1]
+
             # pad before
             if pad_before_num > 0:
                 pad_before = np.zeros((pad_before_num,)+sample.shape[1:], dtype=sample.dtype)
@@ -162,6 +167,7 @@ class SequenceSampler:
                 if not (not self.abs_action and key == 'action'):
                     pad_after[:] = sample[-1]
                 sample = np.concatenate((sample, pad_after), axis=0)
+            
             assert sample.shape[0] == self.sequence_length
             result['data'][key] = sample
 

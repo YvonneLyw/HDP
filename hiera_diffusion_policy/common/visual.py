@@ -1765,7 +1765,7 @@ def getFingersPos(eef_pos, eef_quat, lf_d, rf_d):
     args:
         eef_pos (np.array): 机械臂末端位置, obs['robot0_eef_pos']
         eef_quat (np.array): 机械臂末端四元数, obs['robot0_eef_quat']
-        gripper_width (float): 机械手张开宽度
+        gripper_width (float): 机械手张开宽度       ##夹爪坐标系里两根手指 lf_d, rf_d “沿 y 轴”的位移
 
     return:
         p_W_fl (np.array): 手指1在世界坐标系中的3D坐标
@@ -1773,12 +1773,12 @@ def getFingersPos(eef_pos, eef_quat, lf_d, rf_d):
     """
     # 机械手坐标系：在初始状态时，z轴向下，y轴向左，x轴向屏幕前
     # 计算T_B_E
-    rot_mat = tf.quaternion_to_rotation_matrix(eef_quat)
-    T_W_E = tf.PosRmat_to_TransMat(eef_pos, rot_mat)
-    # p_E_f
+    rot_mat = tf.quaternion_to_rotation_matrix(eef_quat)    ##末端姿态四元数转成 3×3 旋转矩阵
+    T_W_E = tf.PosRmat_to_TransMat(eef_pos, rot_mat)        ##位置 eef_pos 和旋转 rot_mat 合成 4×4 齐次变换矩阵
+    # p_E_f                         ## 手指末端简化为 “末端系里沿 y 轴偏移 lf_d/rf_d 的两个点”
     p_E_fl = np.array([0, lf_d, 0, 1]).reshape(-1, 1)
     p_E_fr = np.array([0, rf_d, 0, 1]).reshape(-1, 1)
-    # p_B_f = T_B_E * p_E_f
+    # p_B_f = T_B_E * p_E_f         ## 用齐次变换把点从 E 变到 W    （4×1），取前三维
     p_W_fl = np.matmul(T_W_E, p_E_fl)
     p_W_fr = np.matmul(T_W_E, p_E_fr)
     p_W_fl = p_W_fl.flatten()[:3]
