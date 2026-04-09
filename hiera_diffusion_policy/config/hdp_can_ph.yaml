@@ -151,7 +151,7 @@ model_critic:
 
 policy:
   _target_: hiera_diffusion_policy.policy.hiera_diffusion_policy.HieraDiffusionPolicy
-  next_action_mode: dataset  #! dataset/pred_local/pred_global
+  next_action_mode: dataset  #! dataset/pred_local/pred_global  ##pred_local： 使用actor预测next_action ##dataset模式：解偶
   action_dim: 10
   horizon: ${horizon}
   subgoal_dim_nocont: ${subgoal_dim_nocont}
@@ -176,7 +176,7 @@ policy:
     beta_end: 0.02
     beta_start: 0.0001
     clip_sample: true
-    num_train_timesteps: 100 #!
+    num_train_timesteps: 100 #!   ##iffusion timestep（0～100）
     prediction_type: epsilon
     variance_type: fixed_small
   noise_scheduler_actor:

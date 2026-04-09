@@ -40,7 +40,8 @@ def create_env(env_meta, obs_keys, enable_render=True):
         # only way to not show collision geometry is to enable render_offscreen
         # which uses a lot of RAM.
         render_offscreen=enable_render, # 原始为False
-        use_image_obs=False,            ## policy 输入不是图像 observation，而是 low-dim state + 额外构造的点云/subgoal
+        #use_image_obs=False,            ## policy 输入不是图像 observation，而是 low-dim state + 额外构造的点云/subgoal
+        use_image_obs=True,    ##use_image_obs=False,            ## policy 输入不是图像 observation，而是 low-dim state + 额外构造的点云/subgoal
     )
     return env
 
@@ -115,6 +116,22 @@ class RobomimicRunner(BasePcdRunner):
         # read from dataset                             ## demo的环境配置
         env_meta = FileUtils.get_env_metadata_from_dataset(
             dataset_path)
+        # ## 确认环境配置里有没有启用对应 camera
+        # print("=" * 80)
+        # print("env_meta keys =", env_meta.keys())
+        # print("env_meta =", env_meta)
+        # print("env_kwargs keys =", env_meta.get("env_kwargs", {}).keys())
+        # print("env_kwargs =", env_meta.get("env_kwargs", {}))
+        # print("=" * 80)
+
+        # ## 临时测试：强行打开 camera obs
+        # env_meta["env_kwargs"]["use_camera_obs"] = True
+        # env_meta["env_kwargs"]["has_offscreen_renderer"] = True
+        # env_meta["env_kwargs"]["camera_names"] = ["agentview", "robot0_eye_in_hand"]
+        # env_meta["env_kwargs"]["camera_heights"] = 84
+        # env_meta["env_kwargs"]["camera_widths"] = 84
+        # env_meta["env_kwargs"]["camera_depths"] = False
+        
         rotation_transformer = None
         if abs_action:
             try:

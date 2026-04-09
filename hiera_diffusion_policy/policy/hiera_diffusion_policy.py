@@ -34,18 +34,18 @@ class HieraDiffusionPolicy(BasePcdPolicy):
             noise_scheduler_guider: DDPMScheduler,
             noise_scheduler_actor: DDPMScheduler,
             horizon=16,
-            action_dim=7,
+            action_dim=7,   ##10
             subgoal_dim=8,
             pcd_dim=3,
             subgoal_dim_nocont=6,
             n_action_steps=8,
             observation_history_num=2,
             use_pcd=True,
-            discount=0.99,
-            eta=1,
-            single_step_reverse_diffusion=False,
-            next_action_mode='pred_global',
-            Tr=1,
+            discount=0.99,  ##0.95
+            eta=1,  ##0.001
+            single_step_reverse_diffusion=False,    ##true
+            next_action_mode='pred_global',     ##dataset
+            Tr=1,   ##8
             fin_rad=0.008,
             is_tilt=False
             ):
@@ -123,7 +123,7 @@ class HieraDiffusionPolicy(BasePcdPolicy):
         with torch.no_grad():
             current_q1, current_q2 = self.critic_target(
                 next_pcd, next_state, next_subgoal, next_action)
-        return torch.min(current_q1, current_q2)
+        return torch.min(current_q1, current_q2)    ## 双targetQ中取小的
     
     def predict_subgoal(self, obs_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         nbatch = self.normalizer.normalize(obs_dict, self.subgoal_dim_nocont)
@@ -260,16 +260,16 @@ class HieraDiffusionPolicy(BasePcdPolicy):
         ).long()
 
         # add noise
-        noise = torch.randn(subgoal.shape, device=self.device)  # Sample noise
-        noisy_sg = self.noise_scheduler_guider.add_noise(subgoal, noise, timesteps)
+        noise = torch.randn(subgoal.shape, device=self.device)  # Sample noise  ##加的噪
+        noisy_sg = self.noise_scheduler_guider.add_noise(subgoal, noise, timesteps) ##一步加噪
 
         # ** pred and loss **
-        state = nbatch['state'].reshape((B, -1))
+        state = nbatch['state'].reshape((B, -1))    ##(B, H=2, 27) -> (B, 展平2*27)
         pcd = None
-        if self.use_pcd:
+        if self.use_pcd:        ##(B, H=2, N=1024, D=3) -> (B, N, H, D)->(B, N, H*D=2*3)
             pcd = nbatch['pcd'].transpose(1, 2).reshape(
                 (B, -1, self.pcd_dim*self.observation_history_num))
-        pred = self.guider(
+        pred = self.guider(         ##前向 预测噪声
             pcd, state, noisy_sg, timesteps)
         assert self.noise_scheduler_guider.config.prediction_type == 'epsilon'
         loss = F.mse_loss(pred, noise)
@@ -286,9 +286,9 @@ class HieraDiffusionPolicy(BasePcdPolicy):
         if self.use_pcd:
             pcd = nbatch['pcd'].transpose(1, 2).reshape(
                     (B, -1, self.pcd_dim*self.observation_history_num))  # (B, 1024, 3n)
-        state = nbatch['state'].reshape((B, -1))
+        state = nbatch['state'].reshape((B, -1))    ##(B, H=2, 27) -> (B, 展平2*27)
         action = nbatch['action'][:, self.observation_history_num-1:
-                                      self.observation_history_num-1+self.Tr]    # (B, A)
+                                      self.observation_history_num-1+self.Tr]    # (B, A)   ##(B, 窗口长, a_dim)-> (B, Tr=8, a_dim)
         # action = action.reshape((B, -1))
         subgoal = nbatch['subgoal'] # (B, 8)
         reward = nbatch['reward']   # (B, 1)
@@ -323,8 +323,6 @@ class HieraDiffusionPolicy(BasePcdPolicy):
                 action += noise
                 reward = torch.zeros((B, 1), device=self.device)
                 dones = torch.ones((B, 1), device=self.device)
-        
-
         """
         只添加平移噪声的方案: 效果不佳
         if np.random.uniform() > 0.5:
@@ -385,10 +383,10 @@ class HieraDiffusionPolicy(BasePcdPolicy):
         pcd = None
         if self.use_pcd:
             pcd = nbatch['pcd'].transpose(1, 2).reshape(
-                (B, -1, self.pcd_dim*self.observation_history_num))
+                (B, -1, self.pcd_dim*self.observation_history_num)) ##(B, H=2, N=1024, D=3) -> (B, N, H*D=2*3)
             if 'pcd_id' in nbatch:
                 pcd = torch.concat((pcd, nbatch['pcd_id']), dim=-1)
-        state = nbatch['state'].reshape((B, -1))  # (B, n*S)
+        state = nbatch['state'].reshape((B, -1))  # (B, n*S)    ##(B, H=2, 27) -> (B, 展平：2*27)
         subgoal = nbatch['subgoal'] if 'subgoal' in nbatch else None
         pred = self.actor(pcd, state, subgoal, noisy_action, timesteps) ## actor网络：noisy_action+条件+时间步 -- u net -->预测噪声
         bc_loss = F.mse_loss(pred, noise)
