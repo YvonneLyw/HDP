@@ -84,7 +84,6 @@ class Actor(nn.Module):
             subgoal_dim,
             use_subgoal,
             use_pcd=True,
-            extra_cond_dim=0,
             down_dims=[256,512,1024],
             kernel_size=3,
             n_groups=8,
@@ -97,7 +96,6 @@ class Actor(nn.Module):
         self.pcd_encoder = pcd_encoder
         self.use_subgoal = use_subgoal
         self.use_pcd = use_pcd
-        self.extra_cond_dim = int(extra_cond_dim)
         
         # Unet action noise predicter
         cond_dim = self.diffusion_step_encoder.out_dim + state_dim
@@ -108,7 +106,6 @@ class Actor(nn.Module):
                 cond_dim += self.pcd_encoder.out_dim
         if use_subgoal:
             cond_dim += subgoal_dim
-        cond_dim += self.extra_cond_dim
 
         # ************* action noise predict *************
         all_dims = [action_dim] + list(down_dims)
@@ -174,8 +171,7 @@ class Actor(nn.Module):
             state: torch.Tensor,
             subgoal: torch.Tensor=None,
             noised_actions: torch.Tensor=None,
-            timestep: torch.Tensor=None,
-            extra_cond: torch.Tensor=None
+            timestep: torch.Tensor=None
             ):
         """ """
 
@@ -208,10 +204,7 @@ class Actor(nn.Module):
 
         if self.use_subgoal and subgoal is not None:
             cond += (subgoal,)
-
-        if extra_cond is not None:
-            cond += (extra_cond,)
-
+        
         global_feature = torch.concat(cond, dim=1)
 
         # ************** state/action **************
@@ -243,3 +236,4 @@ class Actor(nn.Module):
 
     def params_num(self):
         return sum(p.numel() for p in self.parameters())
+

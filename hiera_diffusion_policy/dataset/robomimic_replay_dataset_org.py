@@ -1,4 +1,4 @@
-from typing import Dict, List, Sequence
+from typing import Dict, List
 import torch
 import numpy as np
 import h5py
@@ -22,6 +22,7 @@ from hiera_diffusion_policy.common.normalize_util import (
     array_to_stats
 )
 import robomimic.utils.file_utils as FileUtils
+import open3d as o3d
 import random
 
 
@@ -44,19 +45,9 @@ class RobomimicReplayDataset(BasePcdDataset):
             rotation_rep='rotation_6d',
             seed=42,
             Tr=1,
-            val_ratio=0.02,
-            use_image=False,
-            image_keys: List[str]=None,
-            image_size: Sequence[int]=(84, 84),
-            d3p_query_every=1,
-            d3p_action_chunk_len=None,
-            qpos_normalize=True
+            val_ratio=0.02
         ):
         obs_keys = list(obs_keys)
-        if image_keys is None:
-            image_keys = ['agentview_image', 'robot0_eye_in_hand_image']
-        image_keys = list(image_keys)
-
         rotation_transformer = RotationTransformer(             ## -> action rotation_6d
             from_rep='axis_angle', to_rep=rotation_rep)
 
@@ -83,9 +74,7 @@ class RobomimicReplayDataset(BasePcdDataset):
                     obs_keys=obs_keys,
                     abs_action=abs_action,
                     rotation_transformer=rotation_transformer,
-                    Tr=Tr,
-                    use_image=use_image,
-                    image_keys=image_keys)
+                    Tr=Tr)
 
                 if use_subgoal:
                     #! stage subgoal                               ## 4 Algorithms
@@ -151,22 +140,6 @@ class RobomimicReplayDataset(BasePcdDataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.Tr = Tr
-        self.use_image = use_image
-        self.image_keys = image_keys
-        self.image_size = tuple(int(v) for v in image_size)
-        self.d3p_query_every = int(d3p_query_every)
-        if d3p_action_chunk_len is None:
-            d3p_action_chunk_len = horizon
-        self.d3p_action_chunk_len = int(d3p_action_chunk_len)
-        
-        self.qpos_normalize = bool(qpos_normalize)
-        self.qpos_mean = None
-        self.qpos_std = None
-        if self.use_image and ('qpos_state' in self.replay_buffer):
-            qpos_stat = self.replay_buffer['qpos_state']
-            self.qpos_mean = np.mean(qpos_stat, axis=0).astype(np.float32)
-            self.qpos_std = np.std(qpos_stat, axis=0).astype(np.float32)
-            self.qpos_std = np.clip(self.qpos_std, 1e-2, np.inf)
 
     
     def get_validation_dataset(self):
@@ -228,97 +201,7 @@ class RobomimicReplayDataset(BasePcdDataset):
             }
             data.update(subgoal_data)
 
-        if self.use_image:
-            data.update(self._build_d3p_image_payload(sample, i))
-
         return data
-
-    def _build_d3p_image_payload(self, sample, idx):
-        seq = sample['data']
-        seq_len = seq['front_image'].shape[0]
-
-        # HDP current-t anchor keeps existing semantics with observation history.
-        current_seq_idx = max(0, min(self.observation_history_num - 1, seq_len - 1)) ## 窗口内部的0是哪个内部idx）
-        target_seq_idx = min(current_seq_idx + self.d3p_query_every, seq_len - 1)    ## +h
-
-        ## 图像处理：归一化/255 -> float32 -> CHW
-        front_curr = _hwc_uint8_to_chw_float01(seq['front_image'][current_seq_idx], self.image_size)
-        wrist_curr = _hwc_uint8_to_chw_float01(seq['wrist_image'][current_seq_idx], self.image_size)
-        front_next = _hwc_uint8_to_chw_float01(seq['front_image'][target_seq_idx], self.image_size)
-        wrist_next = _hwc_uint8_to_chw_float01(seq['wrist_image'][target_seq_idx], self.image_size)
-
-        image = np.stack([
-            np.stack([front_curr, wrist_curr], axis=0),
-            np.stack([front_next, wrist_next], axis=0),
-        ], axis=0).astype(np.float32)
-
-        qpos = np.stack([
-            seq['qpos_state'][current_seq_idx],
-            seq['qpos_state'][target_seq_idx],
-        ], axis=0).astype(np.float32)
-        if self.qpos_normalize and (self.qpos_mean is not None):            ##标准化
-            qpos = (qpos - self.qpos_mean[None, :]) / self.qpos_std[None, :]
-
-        """
-        episode_x               |0|1|2|3|4|5|6|7|
-        window[idx]             | | |x|x|x|x|x| |
-        current_seq_idx=1       | | |0|1| | | |5|   target_seq_idx=5
-        start_idx=2             | | |2| | | | | |
-        current_episode_idx=3   | | | |3| | | |7|   target_episode_idx=7
-        """
-
-        ## pad
-        episode_idx, episode_length, start_idx, _ = self.sampler.indices[idx]   ##start_idx：这个窗口在 episode 里的起点（可为负，表示左侧 pad）
-        current_episode_idx = start_idx + current_seq_idx                       ## 窗口起始时间在episode 内时间索引 t
-        target_episode_idx = current_episode_idx + self.d3p_query_every         ## t+h
-
-        episode_action = self._get_episode_action_array(episode_idx)    ## 一整条episode的['action']
-        current_act, current_act_is_pad = self._build_d3p_action_chunk(
-            episode_action, current_episode_idx
-        )
-        target_act, target_act_is_pad = self._build_d3p_action_chunk(
-            episode_action, target_episode_idx
-        )
-        d3p_action_pair = np.stack([current_act, target_act], axis=0).astype(np.float32)
-        act_is_pad_pair = np.stack([current_act_is_pad, target_act_is_pad], axis=0).astype(np.bool_)
-        # obs_is_pad = act_is_pad_pair[:, 0]
-
-        return {
-            'image': image,                     # (2, 2, C, H, W)
-            'qpos': qpos,                       # (2, 9)
-            'd3p_action_pair': d3p_action_pair, # (2, L, 10)
-            'act_is_pad_pair': act_is_pad_pair, # (2, L)
-            # 'obs_is_pad': obs_is_pad,           # (2,)
-        }
-
-    def _get_episode_action_array(self, episode_idx):
-        if episode_idx == 0:
-            start = 0
-        else:
-            start = self.replay_buffer.meta['episode_ends'][episode_idx-1]
-        end = self.replay_buffer.meta['episode_ends'][episode_idx]
-        return self.replay_buffer.data['action'][start:end]
-
-    def _build_d3p_action_chunk(self, episode_action, timestep_idx):
-        episode_len = episode_action.shape[0]
-        chunk = np.zeros(
-            (self.d3p_action_chunk_len, episode_action.shape[-1]),
-            dtype=np.float32
-        )
-        is_pad = np.zeros((self.d3p_action_chunk_len,), dtype=np.bool_)
-
-        for i in range(self.d3p_action_chunk_len):
-            idx = timestep_idx + i
-            if idx < 0:
-                src_idx = 0
-                is_pad[i] = True
-            elif idx > (episode_len - 1):
-                src_idx = episode_len - 1
-                is_pad[i] = True
-            else:
-                src_idx = idx
-            chunk[i] = episode_action[src_idx].astype(np.float32)
-        return chunk, is_pad
 
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:     ## dataset[index]
@@ -338,9 +221,7 @@ def normalizer_from_stat(stat):
     )
     
 
-## def _data_to_obs(raw_obs, obj_pcd, scene_pcd, raw_actions, obs_keys, abs_action, rotation_transformer, Tr):
-def _data_to_obs(raw_obs, obj_pcd, scene_pcd, raw_actions, obs_keys, abs_action,
-                 rotation_transformer, Tr, use_image=False, image_keys=None):
+def _data_to_obs(raw_obs, obj_pcd, scene_pcd, raw_actions, obs_keys, abs_action, rotation_transformer, Tr):
     """
     args:
         raw_obs: h5py dict {
@@ -348,9 +229,6 @@ def _data_to_obs(raw_obs, obj_pcd, scene_pcd, raw_actions, obs_keys, abs_action,
             - robot0_eef_pos
             - robot0_eef_quat
             - robot0_gripper_qpos
-            - agentview_image
-            - robot0_eye_in_hand_image
-            - robot0_joint_pos
         }
         raw_actions: np.ndarray shape=(N, A) N为当前轨迹长度，A为action维度
         obs_keys: list(), 需要的观测, 是raw_obs.keys()的子集合
@@ -400,50 +278,13 @@ def _data_to_obs(raw_obs, obj_pcd, scene_pcd, raw_actions, obs_keys, abs_action,
     # scene_pcd_batch = np.expand_dims(scene_pcd, axis=0).repeat(obs.shape[0], axis=0)    # (N, 1024, 3)
     # pcd_state = np.concatenate((obj_pcd_state, scene_pcd_batch), axis=1)    # (N, 2048, 3)
 
-    if Tr > 0:
-        curr_slice = slice(None, -Tr)   ##[:-Tr]
-        next_slice = slice(Tr, None)    ##[Tr:]
-    else:
-        curr_slice = slice(None)
-        next_slice = slice(None)
-
     data = {
-        'pcd': obj_pcd_state[curr_slice], ## [:-Tr] ##每步的obj点云
-        'state': obs[curr_slice],                   ##拼出来的状态向量：['object'14, 'robot0_eef_pos'3, 'robot0_eef_quat'4]+左手指 xyz + 右手指 xyz
-        'action': raw_actions[curr_slice],          ##动作（rotation_6d）
+        'pcd': obj_pcd_state[:-Tr],     ##每步的obj点云
+        'state': obs[:-Tr],             ##拼出来的状态向量：['object'7, 'robot0_eef_pos'3, 'robot0_eef_quat'4]+左手指 xyz + 右手指 xyz
+        'action': raw_actions[:-Tr],    ##动作（rotation_6d）
         ##（通过 Tr 形成 (s_t, a_t) → (s_{t+Tr}, a_{t+Tr})）
-        'next_pcd': obj_pcd_state[next_slice], ## [Tr:]
-        'next_state': obs[next_slice],
-        'next_action': raw_actions[next_slice],
+        'next_pcd': obj_pcd_state[Tr:],
+        'next_state': obs[Tr:],
+        'next_action': raw_actions[Tr:],
     }
-
-    if use_image:
-        if image_keys is None:
-            raise ValueError("image_keys must be provided when use_image=True")
-        front_key, wrist_key = image_keys
-        qpos = np.concatenate(
-            [raw_obs['robot0_joint_pos'], raw_obs['robot0_gripper_qpos']],
-            axis=-1
-        ).astype(np.float32)
-        data.update({
-            'front_image': np.asarray(raw_obs[front_key][curr_slice]),
-            'wrist_image': np.asarray(raw_obs[wrist_key][curr_slice]),
-            'qpos_state': qpos[curr_slice],
-        })
-
     return data
-
-
-## 图像处理：归一化/255 -> float32 -> CHW
-def _hwc_uint8_to_chw_float01(image_hwc, image_size):
-    image = np.asarray(image_hwc)
-    if image.ndim != 3 or image.shape[-1] != 3:
-        raise ValueError(f"Expected HWC RGB image, got shape={image.shape}")
-    h, w = image.shape[:2]
-    expected_h, expected_w = image_size
-    if (h, w) != (expected_h, expected_w):
-        raise ValueError(
-            f"Unexpected image size {(h, w)}. Config expects {(expected_h, expected_w)}"
-        )
-    image = image.astype(np.float32) / 255.0
-    return np.transpose(image, (2, 0, 1))

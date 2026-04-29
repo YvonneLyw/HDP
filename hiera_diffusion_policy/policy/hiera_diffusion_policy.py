@@ -104,7 +104,7 @@ class HieraDiffusionPolicy(BasePcdPolicy):
         return next(iter(self.parameters())).dtype
 
 
-    # ***************** inference  *****************
+    # ***************** inference  *****************************************************************
     
     def predict_next_Q(self, batch):
         nbatch = self.normalizer.normalize(batch, self.subgoal_dim_nocont)
@@ -231,18 +231,18 @@ class HieraDiffusionPolicy(BasePcdPolicy):
             ## 同一个标量扩散时间步：t（即k） 作用于整个 batch
             ## 输出action_noise：单步预测噪声epsilon（取决于 scheduler 配的 prediction_type）
         for t in timesteps:
-            if model is None:
-                action_noise = self.actor_target(pcd, state, subgoal, action, t)
-            else:
+            if model is None:   ## rollout
+                action_noise = self.actor_target(pcd, state, subgoal, action, t)        ###################################前向
+            else:               ## training
                 action_noise = model(pcd, state, subgoal, action, t)
-            # action        ## 一步反推:x_k到x_k-1
+            # action        ## 反推一步:x_k到x_k-1
                             ## action_noise:单步预测噪声epsilon, t：时间步k, action：x_k
             action = self.noise_scheduler_actor.step(
                 action_noise, t, action, generator=None).prev_sample
         return action
     
 
-    # ***************** training  *****************
+    # ***************** training  *****************************************************************
     def set_normalizer(self, normalizer: Normalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
 
@@ -379,6 +379,7 @@ class HieraDiffusionPolicy(BasePcdPolicy):
         # add noise to action   ## batch内不同样本 使用不同扩散时间步：t（即k）
         noise = torch.randn(nbatch['action'].shape, device=self.device)  # Sample noise
         noisy_action = self.noise_scheduler_actor.add_noise(nbatch['action'], noise, timesteps)
+        
         # pred      ## pred：单步预测噪声epsilon（batchsize 个）”
         pcd = None
         if self.use_pcd:
@@ -388,7 +389,8 @@ class HieraDiffusionPolicy(BasePcdPolicy):
                 pcd = torch.concat((pcd, nbatch['pcd_id']), dim=-1)
         state = nbatch['state'].reshape((B, -1))  # (B, n*S)    ##(B, H=2, 27) -> (B, 展平：2*27)
         subgoal = nbatch['subgoal'] if 'subgoal' in nbatch else None
-        pred = self.actor(pcd, state, subgoal, noisy_action, timesteps) ## actor网络：noisy_action+条件+时间步 -- u net -->预测噪声
+       
+        pred = self.actor(pcd, state, subgoal, noisy_action, timesteps) ## actor网络：noisy_action+条件+时间步 -- u net -->#前向###预测噪声##########################
         bc_loss = F.mse_loss(pred, noise)
         
         # ******** q loss ********
@@ -410,14 +412,14 @@ class HieraDiffusionPolicy(BasePcdPolicy):
                     pred_x0_list.append(step_output.pred_original_sample)
                 new_action_seq = torch.cat(pred_x0_list, dim=0)
             else:
-                # 完整逆扩散
+                # 完整逆扩散    ##重新用纯噪A_k前向###########+完整逆扩散
                 new_action_seq = self.conditional_sample_action(
                     pcd, state, subgoal, model=self.actor)
             new_action = new_action_seq[:, self.observation_history_num-1:
                                         self.observation_history_num-1+self.Tr]
             new_action = new_action.reshape((B, -1))
             q1_new_action, q2_new_action = self.critic(
-                pcd, state, subgoal, new_action)
+                pcd, state, subgoal, new_action)    #######################################################################
 
             if np.random.uniform() > 0.5:
                 q_loss = - q1_new_action.mean() / q2_new_action.abs().mean().detach()
