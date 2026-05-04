@@ -148,7 +148,7 @@ class TrainWorkspace(BaseWorkspace):
         # ************ 设置任务的仿真环境 ************  ##用于评估（仅在actor训练时rollout），每隔 rollout_every 会跑一次
         # if cfg.test_run:
         #     cfg.task.env_runner.n_envs = 1
-        if cfg.train_model == 'actor':
+        if cfg.train_model == 'actor' or cfg.test_run:
             env_runner: BasePcdRunner
             env_runner = hydra.utils.instantiate(
                 cfg.task.env_runner,

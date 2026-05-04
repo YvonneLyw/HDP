@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from hiera_diffusion_policy.model.diffusion.branch_condition_encoder import BranchConditionEncoder
 from hiera_diffusion_policy.policy.hiera_diffusion_policy import HieraDiffusionPolicy
 
 
@@ -32,8 +33,9 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         d3p_enable_switching: bool = False,
         fusion_debug_checks: bool = True,
         extra_cond_dim: int = 64,
-        image_feat_dim: int = 6,
+        image_feat_dim: int = 64,
         qpos_feat_dim: int = 9,
+        image_size=(84, 84),
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -47,8 +49,9 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         self._debug_checked_once = False
 
         self.extra_cond_dim = int(extra_cond_dim)
-        self.image_feat_dim = int(image_feat_dim)
+        self.image_feat_dim = int(image_feat_dim)  # per-view output dim
         self.qpos_feat_dim = int(qpos_feat_dim)
+        self.image_size = tuple(image_size)
 
         if self.d3p_train_branch not in ('A', 'B1', 'B2'):
             raise ValueError(f"d3p_train_branch must be one of ['A','B1','B2'], got {self.d3p_train_branch}")
@@ -63,40 +66,21 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
                 f"actor.extra_cond_dim ({actor_extra_cond_dim}) != policy.extra_cond_dim ({self.extra_cond_dim})"
             )
 
-        # Pair-wise D3P condition encoders (no time flatten).
-        # vis_raw_pair -> vis_enc_pair (analogous to curr_vis_enc / next_vis_enc in D3P).
-        self.vis_encoder = nn.Sequential(
-            nn.Linear(6, self.image_feat_dim),
-            nn.Mish(),
-            nn.Linear(self.image_feat_dim, self.image_feat_dim),
+        self.branch_condition_encoder = BranchConditionEncoder(
+            image_size=self.image_size,
+            per_view_output_dim=self.image_feat_dim,
+            cond_hidden_dim=self.extra_cond_dim,
+            qpos_dim=self.qpos_feat_dim,
+            subgoal_dim=self.subgoal_dim,
+            extra_cond_dim=self.extra_cond_dim,
+            share_rgb_model=False,
+            use_group_norm=True,
+            imagenet_norm=True,
         )
-
-        # B2 condition-2: fea_fuse = fuse(qpos, vis_enc)
-        b2_fuse_in_dim = self.image_feat_dim + self.qpos_feat_dim
-        self.b2_fuse_encoder = nn.Sequential(
-            nn.Linear(b2_fuse_in_dim, self.image_feat_dim),
-            nn.Mish(),
-            nn.Linear(self.image_feat_dim, self.image_feat_dim),
-        )
-
-        # Shared branch condition projector:
-        # B1 input: [vis_enc, subgoal], B2 input: [fea_fuse, subgoal]
-        branch_cond_in_dim = self.image_feat_dim + self.subgoal_dim
-        self.branch_cond_encoder = nn.Linear(branch_cond_in_dim, self.extra_cond_dim)
 
     # =========================
     # Pair feature builders
     # =========================
-    def _build_vis_enc_pair(self, image: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        if image is None:
-            return None
-        # image: (B, 2[t,t+h], 2[front,wrist], C, H, W)
-        img_t = image[:, 0].mean(dim=(-1, -2)).reshape(image.shape[0], -1)   # (B, 6=2图*C3)        ##简单encode,后面需改
-        img_th = image[:, 1].mean(dim=(-1, -2)).reshape(image.shape[0], -1)  # (B, 6=2图*C3)
-        vis_raw_pair = torch.stack((img_t, img_th), dim=1)  # (B, 2, 6)
-        vis_enc_pair = self.vis_encoder(vis_raw_pair)       # (B, 2, image_feat_dim)
-        return vis_enc_pair
-
     def _fit_action_and_pad_to_horizon(
         self,
         d3p_actions: torch.Tensor,
@@ -209,11 +193,11 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
                         f"{tuple(act_is_pad_pair.shape)} vs {tuple(d3p_action_pair.shape)}"
                     )
 
-        vis_enc_pair = self._build_vis_enc_pair(image_pair)
+        vis_enc_pair = self.branch_condition_encoder.encode_vis_pair(image_pair)
 
-        if vis_enc_pair is not None and vis_enc_pair.shape[-1] != self.image_feat_dim:
+        if vis_enc_pair is not None and vis_enc_pair.shape[-1] != self.branch_condition_encoder.vis_dim:
             raise RuntimeError(
-                f"vis_enc_pair dim mismatch: got {vis_enc_pair.shape[-1]}, expected {self.image_feat_dim}"
+                f"vis_enc_pair dim mismatch: got {vis_enc_pair.shape[-1]}, expected {self.branch_condition_encoder.vis_dim}"
             )
         if qpos_pair is not None and qpos_pair.shape[-1] != self.qpos_feat_dim:
             raise RuntimeError(
@@ -221,9 +205,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             )
 
         # D3P-style condition2 in B2: fea_fuse = fuse(qpos, vis_enc)
-        fea_fuse_pair = None
-        if (qpos_pair is not None) and (vis_enc_pair is not None):
-            fea_fuse_pair = self.b2_fuse_encoder(torch.concat((qpos_pair, vis_enc_pair), dim=-1))
+        fea_fuse_pair = self.branch_condition_encoder.encode_fea_fuse_pair(qpos_pair, vis_enc_pair)
 
         
 
@@ -305,8 +287,10 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         elif branch == 'B1':
             if common['vis_enc_pair'] is None:
                 raise RuntimeError('B1 requires vis_enc_pair, but image is missing.')
-            b1_input_pair = torch.concat((common['vis_enc_pair'], common['subgoal_pair']), dim=-1)
-            extra_cond_pair = self.branch_cond_encoder(b1_input_pair)
+            extra_cond_pair = self.branch_condition_encoder.build_b1_extra_cond_pair(
+                common['vis_enc_pair'],
+                common['subgoal_pair'],
+            )
             cond = {
                 'pcd': common['pcd_zero'],
                 'state': common['state_zero'],
@@ -316,8 +300,10 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         elif branch == 'B2':
             if common['fea_fuse_pair'] is None:
                 raise RuntimeError('B2 requires fea_fuse_pair, but image/qpos is missing.')
-            b2_input_pair = torch.concat((common['fea_fuse_pair'], common['subgoal_pair']), dim=-1)
-            extra_cond_pair = self.branch_cond_encoder(b2_input_pair)
+            extra_cond_pair = self.branch_condition_encoder.build_b2_extra_cond_pair(
+                common['fea_fuse_pair'],
+                common['subgoal_pair'],
+            )
             cond = {
                 'pcd': common['pcd_zero'],
                 'state': common['state_zero'],

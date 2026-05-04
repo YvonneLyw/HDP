@@ -162,7 +162,7 @@ policy:
   d3p_switch_signal: 1.0  # 1.0 -> A only, 0.0 -> B only
   d3p_enable_switching: false
   extra_cond_dim: ${extra_cond_dim}  #########################新增############一直到
-  image_feat_dim: 6
+  image_feat_dim: 64
   qpos_feat_dim: 9                     #########################新增############
   next_action_mode: dataset  #! dataset/pred_local/pred_global  ##pred_local： 使用actor预测next_action ##dataset模式：解偶
   action_dim: 10
