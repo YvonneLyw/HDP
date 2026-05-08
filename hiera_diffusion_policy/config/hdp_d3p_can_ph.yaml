@@ -41,7 +41,7 @@ logging:
   resume: false
 
 test_guider: false
-test_run: true #false                               #######################################
+test_run: false
 
 max_train_episodes: null
 use_subgoal: true
@@ -250,6 +250,7 @@ task:
     image_keys: #############################################################################3
     - agentview_image
     - robot0_eye_in_hand_image
+    qpos_normalize: ${task.dataset.qpos_normalize}
     n_action_steps: ${n_action_steps}
     n_envs: 28
     n_latency_steps: 0

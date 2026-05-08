@@ -29,17 +29,10 @@ from hiera_diffusion_policy.common.visual import visual_subgoals_tilt_v44_1, vis
 import cv2
 
 
-def create_env(env_meta, obs_keys, enable_render=True, image_keys=None, extra_low_dim_keys=None):
-    ## 告诉 robomimic: obs_keys 这些key对应的是 low-dimensional observation，不是图片
-    ##########################################################################33
-    low_dim_keys = list(obs_keys)
-    if extra_low_dim_keys:
-        for key in extra_low_dim_keys:
-            if key not in low_dim_keys:
-                low_dim_keys.append(key)
+def create_env(env_meta, lowdim_keys, enable_render=True, image_keys=None):
+    ## 告诉 robomimic: rollout 期间需要保留哪些 low-dimensional observation
     modality_mapping = {
-        ## 'low_dim': list(obs_keys)
-        'low_dim': low_dim_keys
+        'low_dim': list(lowdim_keys)
     }
     if image_keys:
         modality_mapping['rgb'] = list(image_keys)
@@ -55,6 +48,29 @@ def create_env(env_meta, obs_keys, enable_render=True, image_keys=None, extra_lo
         use_image_obs=True,    ##use_image_obs=False,            ## policy 输入不是图像 observation，而是 low-dim state + 额外构造的点云/subgoal
     )
     return env
+
+
+def _stack_rollout_rgb_obs(extras, image_key, expected_hw):
+    """
+    Rollout env images are expected to already be robomimic-processed:
+      - float32 in [0, 1]
+      - CHW layout
+    """
+    image_batch = np.stack([e[image_key] for e in extras], axis=0).astype(np.float32)
+    if image_batch.ndim != 4 or image_batch.shape[1] != 3:
+        raise RuntimeError(
+            f"Rollout {image_key} must be BCHW with 3 channels, got shape={image_batch.shape}"
+        )
+    if tuple(image_batch.shape[-2:]) != tuple(expected_hw):
+        raise RuntimeError(
+            f"Rollout {image_key} size mismatch: expected {tuple(expected_hw)}, got {tuple(image_batch.shape[-2:])}"
+        )
+    if image_batch.min() < -1e-6 or image_batch.max() > 1.0 + 1e-6:
+        raise RuntimeError(
+            f"Rollout {image_key} value range mismatch: expected [0,1], "
+            f"got min={float(image_batch.min()):.4f}, max={float(image_batch.max()):.4f}"
+        )
+    return image_batch
 
 
 class RobomimicRunner(BasePcdRunner):
@@ -83,7 +99,7 @@ class RobomimicRunner(BasePcdRunner):
             render_hw=(256,256),                                #(128,128)
             render_camera_name='agentview',
             image_keys=None,
-            rollout_extra_low_dim_keys=None,
+            qpos_normalize=True,
             fps=10,                                             #
             crf=22,                                             #
             past_action=False,                                  #
@@ -117,13 +133,9 @@ class RobomimicRunner(BasePcdRunner):
         if image_keys is None:
             image_keys = ['agentview_image', 'robot0_eye_in_hand_image']
         image_keys = list(image_keys)
-        if rollout_extra_low_dim_keys is None:
-            rollout_extra_low_dim_keys = [
-                'robot0_joint_pos',
-                'robot0_joint_pos_sin',
-                'robot0_joint_pos_cos',
-            ]
-        rollout_extra_low_dim_keys = list(rollout_extra_low_dim_keys)
+        rollout_lowdim_keys = list(obs_keys)
+        if 'robot0_joint_pos' not in rollout_lowdim_keys:
+            rollout_lowdim_keys.append('robot0_joint_pos')
 
         # handle latency step
         # to mimic latency, we request n_latency_steps additional steps 
@@ -167,9 +179,8 @@ class RobomimicRunner(BasePcdRunner):
             ## 创建原始 robosuite / robomimic 环境（根据demo的环境元信息）
             robomimic_env = create_env(
                     env_meta=env_meta, 
-                    obs_keys=obs_keys,
-                    image_keys=image_keys,
-                    extra_low_dim_keys=rollout_extra_low_dim_keys
+                    lowdim_keys=rollout_lowdim_keys,
+                    image_keys=image_keys
                 )
             # hard reset doesn't influence lowdim env
             # robomimic_env.env.hard_reset = False
@@ -208,9 +219,8 @@ class RobomimicRunner(BasePcdRunner):
         def dummy_env_fn():
             robomimic_env = create_env(
                     env_meta=env_meta, 
-                    obs_keys=obs_keys,
+                    lowdim_keys=rollout_lowdim_keys,
                     image_keys=image_keys,
-                    extra_low_dim_keys=rollout_extra_low_dim_keys,
                     enable_render=False         ## 这里
                 )
             return MultiStepWrapper(
@@ -329,13 +339,22 @@ class RobomimicRunner(BasePcdRunner):
         self.replay_buffer = replay_buffer
         self.test_run = test_run
         self.image_keys = image_keys
-        self.rollout_extra_low_dim_keys = rollout_extra_low_dim_keys
+        self.rollout_lowdim_keys = rollout_lowdim_keys
+        self.qpos_normalize = bool(qpos_normalize)
+        self.qpos_mean = None
+        self.qpos_std = None
+        if self.qpos_normalize and ('qpos_state' in self.replay_buffer):
+            qpos_stat = self.replay_buffer['qpos_state']
+            self.qpos_mean = np.mean(qpos_stat, axis=0).astype(np.float32)
+            self.qpos_std = np.std(qpos_stat, axis=0).astype(np.float32)
+            self.qpos_std = np.clip(self.qpos_std, 1e-2, np.inf)
 
 
     def run(self, policy: BasePcdPolicy, first=False):
         device = policy.device
         dtype = policy.dtype
         env = self.env
+        expected_image_hw = tuple(int(v) for v in getattr(policy, 'image_size', (84, 84)))
         
         # plan for rollout
         n_envs = len(self.env_fns)  # 28                        ## 有28个并行环境
@@ -444,16 +463,14 @@ class RobomimicRunner(BasePcdRunner):
                 ########################### B分支输入量 ##################################################################
                 if use_rollout_image_qpos:
                     extras = env.call('get_policy_extras')
-                    front = np.stack([e['image_0'] for e in extras], axis=0).astype(np.float32) / 255.0
-                    wrist = np.stack([e['image_1'] for e in extras], axis=0).astype(np.float32) / 255.0
-                    front = np.transpose(front, (0, 3, 1, 2))
-                    wrist = np.transpose(wrist, (0, 3, 1, 2))
+                    front = _stack_rollout_rgb_obs(extras, 'front_image', expected_image_hw)
+                    wrist = _stack_rollout_rgb_obs(extras, 'wrist_image', expected_image_hw)
                     image_curr = np.stack((front, wrist), axis=1)  # (B,2,3,H,W)
                     np_obs_dict['image'] = np.stack((image_curr, image_curr), axis=1).astype(np.float32)
 
-                    joint = np.stack([e['robot0_joint_pos'] for e in extras], axis=0).astype(np.float32)
-                    gripper = np.stack([e['robot0_gripper_qpos'] for e in extras], axis=0).astype(np.float32)
-                    qpos_curr = np.concatenate((joint, gripper), axis=-1)  # (B,9)
+                    qpos_curr = np.stack([e['qpos_state'] for e in extras], axis=0).astype(np.float32)
+                    if self.qpos_normalize and (self.qpos_mean is not None):
+                        qpos_curr = (qpos_curr - self.qpos_mean[None, :]) / self.qpos_std[None, :]
                     np_obs_dict['qpos'] = np.stack((qpos_curr, qpos_curr), axis=1).astype(np.float32)
 
                 # device transfer       ## np_obs_dict搬去cuda

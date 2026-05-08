@@ -32,57 +32,6 @@ def updateState(raw_obs, obs_keys):
 
     return obs
 
-############################################################################################
-def _extract_robot0_joint_pos(raw_obs, env: EnvRobosuite):
-    """
-    Try to recover robot0 joint positions from whichever source is available.
-    Preference order:
-      1. raw_obs['robot0_joint_pos']
-      2. reconstruct from raw_obs['robot0_joint_pos_sin/cos']
-      3. read from underlying robosuite robot object / sim state
-    """
-    if 'robot0_joint_pos' in raw_obs:
-        return np.asarray(raw_obs['robot0_joint_pos'], dtype=np.float32)
-
-    sin_key = 'robot0_joint_pos_sin'
-    cos_key = 'robot0_joint_pos_cos'
-    if sin_key in raw_obs and cos_key in raw_obs:
-        sin_v = np.asarray(raw_obs[sin_key], dtype=np.float32)
-        cos_v = np.asarray(raw_obs[cos_key], dtype=np.float32)
-        return np.arctan2(sin_v, cos_v).astype(np.float32)
-
-    base_env = getattr(env, 'env', None)
-    if base_env is not None:
-        robots = getattr(base_env, 'robots', None)
-        if robots:
-            robot0 = robots[0]
-
-            for attr in ('_joint_positions', 'joint_positions'):
-                if hasattr(robot0, attr):
-                    value = np.asarray(getattr(robot0, attr), dtype=np.float32)
-                    if value.ndim == 1 and value.shape[0] > 0:
-                        return value
-
-            sim = getattr(base_env, 'sim', None)
-            if sim is not None:
-                data = getattr(sim, 'data', None)
-                if data is not None and hasattr(data, 'qpos'):
-                    for attr in ('_ref_joint_pos_indexes', 'joint_indexes'):
-                        if hasattr(robot0, attr):
-                            index = getattr(robot0, attr)
-                            try:
-                                value = np.asarray(data.qpos[index], dtype=np.float32)
-                                if value.ndim == 1 and value.shape[0] > 0:
-                                    return value
-                            except Exception:
-                                pass
-
-    available = sorted(raw_obs.keys())
-    raise KeyError(
-        "robot0_joint_pos is unavailable and could not be recovered from "
-        f"robot0_joint_pos_sin/cos or robosuite internals. Available observation keys: {available}"
-    )
-
 
 class RobomimicPcdWrapper(gym.Env):
     def __init__(self, 
@@ -184,25 +133,31 @@ class RobomimicPcdWrapper(gym.Env):
     ########################### B分支输入量 ##################################################################
     def get_policy_extras(self):
         """
-        Return raw image / proprio keys needed by D3P branch at rollout time.
+        Return image / proprio payload with the same semantics as the training dataset.
         """
         raw = self._last_raw_obs
         if raw is None:
             raw = self.env.get_observation()
             self._last_raw_obs = raw
 
-        missing = [key for key in self.image_keys if key not in raw]
+        required_keys = list(self.image_keys) + [
+            'robot0_joint_pos',
+            'robot0_gripper_qpos',
+        ]
+        missing = [key for key in required_keys if key not in raw]
         if missing:
             raise KeyError(
-                f"Missing rollout image keys {missing}. Available observation keys: {sorted(raw.keys())}"
+                f"Missing rollout keys {missing}. Available observation keys: {sorted(raw.keys())}"
             )
-        joint_pos = _extract_robot0_joint_pos(raw, self.env)
+        qpos_state = np.concatenate(
+            [raw['robot0_joint_pos'], raw['robot0_gripper_qpos']],
+            axis=-1
+        ).astype(np.float32)
 
         return {
-            'image_0': np.array(raw[self.image_keys[0]], copy=True),
-            'image_1': np.array(raw[self.image_keys[1]], copy=True),
-            'robot0_joint_pos': np.array(joint_pos, copy=True),
-            'robot0_gripper_qpos': np.array(raw['robot0_gripper_qpos'], copy=True),
+            'front_image': np.array(raw[self.image_keys[0]], copy=True),
+            'wrist_image': np.array(raw[self.image_keys[1]], copy=True),
+            'qpos_state': np.array(qpos_state, copy=True),
         }
     
     def render(self, mode='rgb_array'):
