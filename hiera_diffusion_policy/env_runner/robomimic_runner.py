@@ -29,10 +29,21 @@ from hiera_diffusion_policy.common.visual import visual_subgoals_tilt_v44_1, vis
 import cv2
 
 
-def create_env(env_meta, obs_keys, enable_render=True):
+def create_env(env_meta, obs_keys, enable_render=True, image_keys=None, extra_low_dim_keys=None):
     ## 告诉 robomimic: obs_keys 这些key对应的是 low-dimensional observation，不是图片
-    ObsUtils.initialize_obs_modality_mapping_from_dict(
-        {'low_dim': obs_keys})
+    ##########################################################################33
+    low_dim_keys = list(obs_keys)
+    if extra_low_dim_keys:
+        for key in extra_low_dim_keys:
+            if key not in low_dim_keys:
+                low_dim_keys.append(key)
+    modality_mapping = {
+        ## 'low_dim': list(obs_keys)
+        'low_dim': low_dim_keys
+    }
+    if image_keys:
+        modality_mapping['rgb'] = list(image_keys)
+    ObsUtils.initialize_obs_modality_mapping_from_dict(modality_mapping)
     ## 根据dataset里的环境元信息env_meta恢复仿真环境
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
@@ -71,6 +82,8 @@ class RobomimicRunner(BasePcdRunner):
             # 渲染参数
             render_hw=(256,256),                                #(128,128)
             render_camera_name='agentview',
+            image_keys=None,
+            rollout_extra_low_dim_keys=None,
             fps=10,                                             #
             crf=22,                                             #
             past_action=False,                                  #
@@ -101,6 +114,16 @@ class RobomimicRunner(BasePcdRunner):
 
         if n_envs is None:
             n_envs = n_train + n_test
+        if image_keys is None:
+            image_keys = ['agentview_image', 'robot0_eye_in_hand_image']
+        image_keys = list(image_keys)
+        if rollout_extra_low_dim_keys is None:
+            rollout_extra_low_dim_keys = [
+                'robot0_joint_pos',
+                'robot0_joint_pos_sin',
+                'robot0_joint_pos_cos',
+            ]
+        rollout_extra_low_dim_keys = list(rollout_extra_low_dim_keys)
 
         # handle latency step
         # to mimic latency, we request n_latency_steps additional steps 
@@ -144,7 +167,9 @@ class RobomimicRunner(BasePcdRunner):
             ## 创建原始 robosuite / robomimic 环境（根据demo的环境元信息）
             robomimic_env = create_env(
                     env_meta=env_meta, 
-                    obs_keys=obs_keys
+                    obs_keys=obs_keys,
+                    image_keys=image_keys,
+                    extra_low_dim_keys=rollout_extra_low_dim_keys
                 )
             # hard reset doesn't influence lowdim env
             # robomimic_env.env.hard_reset = False
@@ -154,6 +179,7 @@ class RobomimicRunner(BasePcdRunner):
                         RobomimicPcdWrapper(                        ## 单步的标准 gym 环境，并且统一获得的obs格式
                             env=robomimic_env,
                             obs_keys=obs_keys,
+                            image_keys=image_keys,
                             init_state=None,
                             render_hw=render_hw,
                             render_camera_name=render_camera_name
@@ -183,6 +209,8 @@ class RobomimicRunner(BasePcdRunner):
             robomimic_env = create_env(
                     env_meta=env_meta, 
                     obs_keys=obs_keys,
+                    image_keys=image_keys,
+                    extra_low_dim_keys=rollout_extra_low_dim_keys,
                     enable_render=False         ## 这里
                 )
             return MultiStepWrapper(
@@ -190,6 +218,7 @@ class RobomimicRunner(BasePcdRunner):
                         RobomimicPcdWrapper(
                             env=robomimic_env,
                             obs_keys=obs_keys,
+                            image_keys=image_keys,
                             init_state=None,
                             render_hw=render_hw,
                             render_camera_name=render_camera_name
@@ -299,6 +328,8 @@ class RobomimicRunner(BasePcdRunner):
         self.tqdm_interval_sec = tqdm_interval_sec
         self.replay_buffer = replay_buffer
         self.test_run = test_run
+        self.image_keys = image_keys
+        self.rollout_extra_low_dim_keys = rollout_extra_low_dim_keys
 
 
     def run(self, policy: BasePcdPolicy, first=False):
@@ -314,6 +345,9 @@ class RobomimicRunner(BasePcdRunner):
         # allocate data     ##分配结果存储空间
         all_video_paths = [None] * n_inits
         all_rewards = [None] * n_inits
+        branch_err_A_trace = list()
+        branch_err_B_trace = list()
+        selected_branch_trace = list()
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
@@ -338,6 +372,11 @@ class RobomimicRunner(BasePcdRunner):
             # past_action = None
             policy.reset()  ## 清除policy内部状态（RNN hidden state，历史缓存，扩散采样状态。。。）
             B = n_envs  ## 28
+            ########################### use_rollout_image_qpos：是否需要B分支输入 ###########################################
+            if hasattr(policy, 'needs_rollout_image_qpos'):
+                use_rollout_image_qpos = bool(policy.needs_rollout_image_qpos())
+            else:
+                use_rollout_image_qpos = hasattr(policy, 'branch_condition_encoder')
             if first: return    ## 调试用，只reset不rollout
 
             # **** 记录图像和轨迹 ****
@@ -361,6 +400,7 @@ class RobomimicRunner(BasePcdRunner):
             done = False
             nnn = 0
             while not done:
+                ########################### A分支输入量 ##################################################################
                 # create obs dict
                 np_obs_dict = {
                     # handle n_latency_steps by discarding the last n_latency_steps
@@ -401,6 +441,21 @@ class RobomimicRunner(BasePcdRunner):
                     #     visual_subgoals_tilt_v44_2(
                     #         state[b, -1], np_obs_dict['subgoal'][b], scene_pcd[b], object_pcd[b])
 
+                ########################### B分支输入量 ##################################################################
+                if use_rollout_image_qpos:
+                    extras = env.call('get_policy_extras')
+                    front = np.stack([e['image_0'] for e in extras], axis=0).astype(np.float32) / 255.0
+                    wrist = np.stack([e['image_1'] for e in extras], axis=0).astype(np.float32) / 255.0
+                    front = np.transpose(front, (0, 3, 1, 2))
+                    wrist = np.transpose(wrist, (0, 3, 1, 2))
+                    image_curr = np.stack((front, wrist), axis=1)  # (B,2,3,H,W)
+                    np_obs_dict['image'] = np.stack((image_curr, image_curr), axis=1).astype(np.float32)
+
+                    joint = np.stack([e['robot0_joint_pos'] for e in extras], axis=0).astype(np.float32)
+                    gripper = np.stack([e['robot0_gripper_qpos'] for e in extras], axis=0).astype(np.float32)
+                    qpos_curr = np.concatenate((joint, gripper), axis=-1)  # (B,9)
+                    np_obs_dict['qpos'] = np.stack((qpos_curr, qpos_curr), axis=1).astype(np.float32)
+
                 # device transfer       ## np_obs_dict搬去cuda
                 Tinput_dict = dict_apply(np_obs_dict, 
                     lambda x: torch.from_numpy(x).to(device=device))
@@ -412,6 +467,13 @@ class RobomimicRunner(BasePcdRunner):
                 # device_transfer
                 np_action_dict = dict_apply(action_dict,
                     lambda x: x.detach().to('cpu').numpy())
+                ## 从 policy 输出：err等 取诊断字段做日志聚合#########################
+                if 'branch_err_A' in np_action_dict:
+                    branch_err_A_trace.append(float(np_action_dict['branch_err_A'].mean()))
+                if 'branch_err_B' in np_action_dict:
+                    branch_err_B_trace.append(float(np_action_dict['branch_err_B'].mean()))
+                if 'selected_branch' in np_action_dict:
+                    selected_branch_trace.append(float(np_action_dict['selected_branch'].mean()))
 
                 # handle latency_steps, we discard the first n_latency_steps actions
                 # to simulate latency
@@ -479,6 +541,16 @@ class RobomimicRunner(BasePcdRunner):
             name = prefix+'mean_score'
             value = np.mean(value)
             log_data[name] = value
+
+        ###### 记录policy输出########################
+        if len(branch_err_A_trace) > 0:
+            log_data['branch_err_A_mean'] = float(np.mean(branch_err_A_trace))
+        if len(branch_err_B_trace) > 0:
+            log_data['branch_err_B_mean'] = float(np.mean(branch_err_B_trace))
+        if len(selected_branch_trace) > 0:
+            selected_b_ratio = float(np.mean(selected_branch_trace))
+            log_data['selected_branch_B_ratio'] = selected_b_ratio
+            log_data['selected_branch_A_ratio'] = 1.0 - selected_b_ratio
 
         return log_data
     

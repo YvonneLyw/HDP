@@ -46,15 +46,14 @@ test_run: true #false                               ############################
 max_train_episodes: null
 use_subgoal: true
 use_pcd: true # 只限制actor
-use_image: false                #########################新增############
-use_qpos: false
+use_image: true                #########################新增############
 single_step_reverse_diffusion: true
 eta: 0.001
 subgoal_dim: 8
 subgoal_dim_nocont: 6
 extra_cond_dim: 64   #########################新增############
 
-n_action_steps: 8
+n_action_steps: 4 ##原版8###############################！！！
 horizon: 16
 Tr: 8
 n_latency_steps: 0
@@ -157,11 +156,13 @@ policy:
   _target_: hiera_diffusion_policy.policy.hiera_diffusion_policy_d3p_fusion.HieraDiffusionPolicyD3PFusion
   fusion_debug_checks: true
   d3p_query_every: ${task.dataset.d3p_query_every}
-  d3p_train_branch: A   # A / B1 / B2
-  d3p_b_branch: B1
-  d3p_switch_signal: 1.0  # 1.0 -> A only, 0.0 -> B only
-  d3p_enable_switching: false
-  extra_cond_dim: ${extra_cond_dim}  #########################新增############一直到
+  #########################新增############一直到
+  mode: SINGLE            # SINGLE / SWITCH
+  single_branch: A        # A / B1 / B2 (mode=SINGLE 时训练和rollout都用这个分支)
+  b_branch: B1            # B1 / B2 (mode=SWITCH 时与A做训练切换和rollout选择)
+  switch_prob_b: 0.5      # mode=SWITCH 时训练阶段采样 B 分支概率
+  d3p_rollout_error_samples: 10
+  extra_cond_dim: ${extra_cond_dim}  
   image_feat_dim: 64
   qpos_feat_dim: 9                     #########################新增############
   next_action_mode: dataset  #! dataset/pred_local/pred_global  ##pred_local： 使用actor预测next_action ##dataset模式：解偶
@@ -246,6 +247,9 @@ task:
     max_steps: 500
     use_subgoal: ${use_subgoal}
     use_pcd: ${use_pcd}
+    image_keys: #############################################################################3
+    - agentview_image
+    - robot0_eye_in_hand_image
     n_action_steps: ${n_action_steps}
     n_envs: 28
     n_latency_steps: 0

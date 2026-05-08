@@ -500,13 +500,25 @@ class TrainWorkspace(BaseWorkspace):
                         with torch.no_grad():
                             batch = train_sampling_batch    # Tensor, no norm
 
-                            pred_action = self.model.predict_action(batch)['action_pred']
+                            #################### 做一次采样评估并记日志：新增 pred_out#######################
+                            ## pred_action = self.model.predict_action(batch)['action_pred']
+                            pred_out = self.model.predict_action(batch)
+                            pred_action = pred_out['action_pred']
                             mse_action = torch.nn.functional.mse_loss(pred_action, batch['action'])
                             step_log['train_mse_error_action'] = mse_action.item()
+                            if 'branch_err_A' in pred_out:
+                                step_log['train_branch_err_A'] = pred_out['branch_err_A'].mean().item()
+                            if 'branch_err_B' in pred_out:
+                                step_log['train_branch_err_B'] = pred_out['branch_err_B'].mean().item()
+                            if 'selected_branch' in pred_out:
+                                selected_b_ratio = pred_out['selected_branch'].mean().item()
+                                step_log['train_selected_branch_B_ratio'] = selected_b_ratio
+                                step_log['train_selected_branch_A_ratio'] = 1.0 - selected_b_ratio
                             
                             # release RAM
                             del batch
-                            del pred_action, mse_action
+                            ## del pred_action, mse_action
+                            del pred_out, pred_action, mse_action
                     
                     # ************ checkpoint ************
                     if (self.epoch_actor % cfg.training.checkpoint_every) == 0:

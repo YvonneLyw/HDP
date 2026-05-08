@@ -32,6 +32,57 @@ def updateState(raw_obs, obs_keys):
 
     return obs
 
+############################################################################################
+def _extract_robot0_joint_pos(raw_obs, env: EnvRobosuite):
+    """
+    Try to recover robot0 joint positions from whichever source is available.
+    Preference order:
+      1. raw_obs['robot0_joint_pos']
+      2. reconstruct from raw_obs['robot0_joint_pos_sin/cos']
+      3. read from underlying robosuite robot object / sim state
+    """
+    if 'robot0_joint_pos' in raw_obs:
+        return np.asarray(raw_obs['robot0_joint_pos'], dtype=np.float32)
+
+    sin_key = 'robot0_joint_pos_sin'
+    cos_key = 'robot0_joint_pos_cos'
+    if sin_key in raw_obs and cos_key in raw_obs:
+        sin_v = np.asarray(raw_obs[sin_key], dtype=np.float32)
+        cos_v = np.asarray(raw_obs[cos_key], dtype=np.float32)
+        return np.arctan2(sin_v, cos_v).astype(np.float32)
+
+    base_env = getattr(env, 'env', None)
+    if base_env is not None:
+        robots = getattr(base_env, 'robots', None)
+        if robots:
+            robot0 = robots[0]
+
+            for attr in ('_joint_positions', 'joint_positions'):
+                if hasattr(robot0, attr):
+                    value = np.asarray(getattr(robot0, attr), dtype=np.float32)
+                    if value.ndim == 1 and value.shape[0] > 0:
+                        return value
+
+            sim = getattr(base_env, 'sim', None)
+            if sim is not None:
+                data = getattr(sim, 'data', None)
+                if data is not None and hasattr(data, 'qpos'):
+                    for attr in ('_ref_joint_pos_indexes', 'joint_indexes'):
+                        if hasattr(robot0, attr):
+                            index = getattr(robot0, attr)
+                            try:
+                                value = np.asarray(data.qpos[index], dtype=np.float32)
+                                if value.ndim == 1 and value.shape[0] > 0:
+                                    return value
+                            except Exception:
+                                pass
+
+    available = sorted(raw_obs.keys())
+    raise KeyError(
+        "robot0_joint_pos is unavailable and could not be recovered from "
+        f"robot0_joint_pos_sin/cos or robosuite internals. Available observation keys: {available}"
+    )
+
 
 class RobomimicPcdWrapper(gym.Env):
     def __init__(self, 
@@ -41,6 +92,7 @@ class RobomimicPcdWrapper(gym.Env):
             'robot0_eef_pos', 
             'robot0_eef_quat', 
             'robot0_gripper_qpos'],
+        image_keys: Optional[List[str]]=None,
         init_state: Optional[np.ndarray]=None,          ## 如果不为空，reset 时固定到这个状态
         render_hw=(256,256),                            ## 渲染图像大小 (128,128)
         render_camera_name='agentview'                  ## 用哪个相机视角渲染
@@ -48,11 +100,17 @@ class RobomimicPcdWrapper(gym.Env):
 
         self.env = env
         self.obs_keys = obs_keys
+        if image_keys is None:
+            image_keys = ['agentview_image', 'robot0_eye_in_hand_image']
+        self.image_keys = list(image_keys)
+        if len(self.image_keys) != 2:
+            raise ValueError(f"Expected exactly 2 image keys for rollout extras, got {self.image_keys}")
         self.init_state = init_state
         self.render_hw = render_hw
         self.render_camera_name = render_camera_name
         self.seed_state_map = dict()                    ## 缓存“seed 对应的初始状态”
         self._seed = None                               ## 下次 reset 要使用的 seed
+        self._last_raw_obs = None           ##################新增####################################################
         
         # setup spaces      ## 环境action space设置成标准 gym.spaces.Box：dim：env.action_dimension，每一维范围 [-1, 1]
         low = np.full(env.action_dimension, fill_value=-1)      ## env.action_dimension：从底层robomimic环境获取，最初是从demo的env_meta（中的controller配置）定义环境
@@ -83,6 +141,7 @@ class RobomimicPcdWrapper(gym.Env):
         获取flatten的观测数据
         """
         raw_obs = self.env.get_observation()
+        self._last_raw_obs = raw_obs
         obs = updateState(raw_obs, self.obs_keys)       ## 将 robot0_gripper_qpos 替换为 finger pos
         return obs
 
@@ -117,9 +176,34 @@ class RobomimicPcdWrapper(gym.Env):
     
     def step(self, action):     ## 执行一步 action
         raw_obs, reward, done, info = self.env.step(action)
+        self._last_raw_obs = raw_obs
 
         obs = updateState(raw_obs, self.obs_keys)       ##obs = [object, eef_pos, eef_quat, fl_pos, fr_pos]
         return obs, reward, done, info
+
+    ########################### B分支输入量 ##################################################################
+    def get_policy_extras(self):
+        """
+        Return raw image / proprio keys needed by D3P branch at rollout time.
+        """
+        raw = self._last_raw_obs
+        if raw is None:
+            raw = self.env.get_observation()
+            self._last_raw_obs = raw
+
+        missing = [key for key in self.image_keys if key not in raw]
+        if missing:
+            raise KeyError(
+                f"Missing rollout image keys {missing}. Available observation keys: {sorted(raw.keys())}"
+            )
+        joint_pos = _extract_robot0_joint_pos(raw, self.env)
+
+        return {
+            'image_0': np.array(raw[self.image_keys[0]], copy=True),
+            'image_1': np.array(raw[self.image_keys[1]], copy=True),
+            'robot0_joint_pos': np.array(joint_pos, copy=True),
+            'robot0_gripper_qpos': np.array(raw['robot0_gripper_qpos'], copy=True),
+        }
     
     def render(self, mode='rgb_array'):
         h, w = self.render_hw
