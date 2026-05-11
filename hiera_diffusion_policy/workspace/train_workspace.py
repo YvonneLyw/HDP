@@ -446,6 +446,8 @@ class TrainWorkspace(BaseWorkspace):
                                 'lr_actor': lr_scheduler_actor.get_last_lr()[0],
                                 'eta': cfg.policy.eta
                             }
+                            if hasattr(self.model, 'get_last_actor_aux_logs'):
+                                step_log.update(self.model.get_last_actor_aux_logs())
 
                             is_last_batch = (batch_idx == (len(train_dataloader)-1))
                             if not is_last_batch:
