@@ -80,6 +80,12 @@ class HieraDiffusionPolicyD3PBOnly(HieraDiffusionPolicyD3PFusion):
 
         self._last_actor_aux_logs: Dict[str, float] = {}
 
+    ########## 模型（actor,branch_condition_encoder，dko）参数加入optimizer############ D3P B-only 把3个一起训
+    def get_actor_training_parameters(self):
+        # B-only actor training also optimizes DKO because Koopman losses are part
+        # of the actor-stage objective.
+        return super().get_actor_training_parameters() + list(self.dko.parameters())
+
     def _prepare_branch_inputs(
         self,
         raw_batch: Dict[str, torch.Tensor],

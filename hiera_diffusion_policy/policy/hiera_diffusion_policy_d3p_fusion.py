@@ -91,6 +91,12 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             imagenet_norm=True,
         )
 
+    ########## 模型（actor,branch_condition_encoder，dko）参数加入optimizer############ D3P fusion 把actor+ branch_condition_encoder 一起训
+    def get_actor_training_parameters(self):
+        # B-branch actor losses depend on branch_condition_encoder outputs, so it
+        # must be optimized together with the actor during the actor stage.
+        return list(self.actor.parameters()) + list(self.branch_condition_encoder.parameters())
+
     # =========================
     # Pair feature builders
     # =========================
@@ -583,7 +589,13 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
                 out['branch_err_B'] = err.unsqueeze(-1)
                 out['selected_branch'] = torch.ones_like(err.unsqueeze(-1))     ## 1
             return out
-
+            # out: = {
+            #     "action_pred": action,          # full predicted action sequence
+            #     "action": action_run,           # action segment to execute
+            #     "branch_err_A": branch_err_A,   # branch A reconstruction / DDPM error
+            #     "branch_err_B": branch_err_B,   # branch B reconstruction / DDPM error
+            #     "selected_branch": selected_branch,
+            # }
         ########################A分支############################
         cond_A = self._build_cond_by_branch('A', common)
         cond_A_run = self._rollout_cond_from_branch_cond(cond_A)

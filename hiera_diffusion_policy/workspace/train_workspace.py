@@ -63,7 +63,12 @@ class TrainWorkspace(BaseWorkspace):
 
         # configure training state
         self.optimizer_guider = hydra.utils.instantiate(cfg.optimizer_guider, params=self.model.guider.parameters())
-        self.optimizer_actor = hydra.utils.instantiate(cfg.optimizer_actor, params=self.model.actor.parameters())
+        ## self.optimizer_actor = hydra.utils.instantiate(cfg.optimizer_actor, params=self.model.actor.parameters())
+        ########## 模型（actor,branch_condition_encoder，dko）参数加入optimizer############
+        self.optimizer_actor = hydra.utils.instantiate(
+            cfg.optimizer_actor,
+            params=self.model.get_actor_training_parameters()
+        )
         self.optimizer_critic = hydra.utils.instantiate(cfg.optimizer_critic, params=self.model.critic.parameters())
 
         self.global_step_guider = 0

@@ -103,6 +103,15 @@ class HieraDiffusionPolicy(BasePcdPolicy):
     def dtype(self):
         return next(iter(self.parameters())).dtype
 
+    ########## 模型（actor,branch_condition_encoder，dko）参数加入optimizer############ base policy 默认还是只训 actor
+    def get_actor_training_parameters(self):
+        """
+        Parameters updated during the actor stage.
+        Policies with extra condition encoders can override this to include
+        modules outside self.actor that should learn from actor-side losses.
+        """
+        return list(self.actor.parameters())
+
 
     # ***************** inference  *****************************************************************
     
@@ -171,17 +180,16 @@ class HieraDiffusionPolicy(BasePcdPolicy):
         subgoal = nobs['subgoal'] if 'subgoal' in nobs else None   # use subgoal
         
         with torch.no_grad():
-            action = self.conditional_sample_action(pcd, state, subgoal)
-        action = self.normalizer.unnormalize(naction=action)
-
+            action = self.conditional_sample_action(pcd, state, subgoal)    ## 用纯噪A_k前向###########+完整逆扩散---->生成最终action
+        action = self.normalizer.unnormalize(naction=action)     ## 把归一化动作还原成真实动作
         # get action
         start = self.observation_history_num - 1
         end = start + self.n_action_steps   # 1 + 8
         action_run = action[:,start:end]   # (B, 1:9, A)
 
         result = {
-            'action': action_run,
-            'action_pred': action,
+            'action': action_run,   ## 真实要执行的 action 段
+            'action_pred': action,  ## 完整预测AC
         }
         return result
     
@@ -205,7 +213,7 @@ class HieraDiffusionPolicy(BasePcdPolicy):
         next_action = self.normalizer.unnormalize(naction=next_action)
         return next_action
     
-
+    ### 用纯噪A_k前向###########+完整逆扩散---->生成最终action
     def conditional_sample_action(
             self, pcd, state, subgoal=None, action_init=None, model:Actor =None):
         """
