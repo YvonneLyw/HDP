@@ -155,6 +155,8 @@ class RobomimicReplayDataset(BasePcdDataset):
         self.image_keys = image_keys
         self.image_size = tuple(int(v) for v in image_size)
         self.d3p_query_every = int(d3p_query_every)
+        if self.use_image and (not self.use_subgoal):
+            raise ValueError("use_image=True requires use_subgoal=True for d3p_subgoal_pair.")
         if d3p_action_chunk_len is None:
             d3p_action_chunk_len = horizon
         self.d3p_action_chunk_len = int(d3p_action_chunk_len)
@@ -259,6 +261,11 @@ class RobomimicReplayDataset(BasePcdDataset):
         if self.qpos_normalize and (self.qpos_mean is not None):            ##标准化
             qpos = (qpos - self.qpos_mean[None, :]) / self.qpos_std[None, :]
 
+        d3p_subgoal_pair = np.stack([
+            seq['subgoal'][current_seq_idx],
+            seq['subgoal'][target_seq_idx],
+        ], axis=0).astype(np.float32)
+
         """
         episode_x               |0|1|2|3|4|5|6|7|
         window[idx]             | | |x|x|x|x|x| |
@@ -283,13 +290,15 @@ class RobomimicReplayDataset(BasePcdDataset):
         act_is_pad_pair = np.stack([current_act_is_pad, target_act_is_pad], axis=0).astype(np.bool_)
         # obs_is_pad = act_is_pad_pair[:, 0]
 
-        return {
+        payload = {
             'image': image,                     # (2, 2, C, H, W)
             'qpos': qpos,                       # (2, 9)
             'd3p_action_pair': d3p_action_pair, # (2, L, 10)
             'act_is_pad_pair': act_is_pad_pair, # (2, L)
+            'd3p_subgoal_pair': d3p_subgoal_pair, # (2, subgoal_dim)
             # 'obs_is_pad': obs_is_pad,           # (2,)
         }
+        return payload
 
     def _get_episode_action_array(self, episode_idx):
         if episode_idx == 0:

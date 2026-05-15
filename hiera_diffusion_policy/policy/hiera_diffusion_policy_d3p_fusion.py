@@ -1,11 +1,17 @@
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from hiera_diffusion_policy.model.diffusion.branch_condition_encoder import BranchConditionEncoder
+from hiera_diffusion_policy.model.diffusion.d3p_koopman import DeepKoopmanModule
 from hiera_diffusion_policy.policy.hiera_diffusion_policy import HieraDiffusionPolicy
+
+try:
+    import imgaug.augmenters as iaa
+except ImportError:
+    iaa = None
 
 
 class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
@@ -19,7 +25,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
 
     Notes:
       - actor_small only receives extra_cond; no image/qpos/sub-branch args are passed into actor.
-      - subgoal_pair keeps two timesteps but currently duplicates current subgoal for both slots.
+      - subgoal_pair prefers dataset-provided (t, t+h) subgoals and only falls back to
+        duplicating current subgoal when explicit pair data is unavailable.
       - B branch BC loss uses two timestamps (t and t+h) with 0.5/0.5 weighting.
     """
     # A-only：policy.mode=SINGLE policy.single_branch=A
@@ -37,6 +44,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         switch_prob_b: float = 0.5,
         d3p_rollout_error_samples: int = 10,
         fusion_debug_checks: bool = True,
+        use_koopman_aux: bool = False,
         extra_cond_dim: int = 64,
         image_feat_dim: int = 64,
         qpos_feat_dim: int = 9,
@@ -54,6 +62,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         self.d3p_rollout_error_samples = int(d3p_rollout_error_samples)
         self.fusion_debug_checks = bool(fusion_debug_checks)
         self._debug_checked_once = False
+        self.use_koopman_aux = bool(use_koopman_aux)
 
         self.extra_cond_dim = int(extra_cond_dim)
         self.image_feat_dim = int(image_feat_dim)  # per-view output dim
@@ -91,11 +100,42 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             imagenet_norm=True,
         )
 
-    ########## 模型（actor,branch_condition_encoder，dko）参数加入optimizer############ D3P fusion 把actor+ branch_condition_encoder 一起训
+        self.koopman_kvp_weight = 0.3
+        self.koopman_fea_weight = 0.7
+        self.koopman_use_augmentation = True
+        self.koopman_aug_crop_pad = 0.10
+        self.koopman_aug_rotate = 15.0
+        self.koopman_aug_noise_scale = 0.02
+        self.koopman_aug_brightness_min = 0.9
+        self.koopman_aug_brightness_max = 1.1
+        self._last_actor_aux_logs: Dict[str, float] = {
+            'train_koop_consis_kvp': 0.0,
+            'train_koop_consis_fea': 0.0,
+        }
+
+        if self.use_koopman_aux:
+            self.dko = DeepKoopmanModule(
+                obs_dim=self.branch_condition_encoder.vis_dim,
+                latent_act_dim=self.extra_cond_dim,
+                hidden_dim=128,
+                num_hidden_layers=4,
+                dropout=0.0,
+                activation='ReLU',
+                use_spectral_norm=False,
+                use_norm=False,
+                norm_style='BatchNorm',
+            )
+        else:
+            self.dko = None
+
+    ########## 模型（actor,branch_condition_encoder，dko）参数加入optimizer############ D3P fusion 把actor+ branch_condition_encoder （+dko）一起训
     def get_actor_training_parameters(self):
         # B-branch actor losses depend on branch_condition_encoder outputs, so it
         # must be optimized together with the actor during the actor stage.
-        return list(self.actor.parameters()) + list(self.branch_condition_encoder.parameters())
+        params = list(self.actor.parameters()) + list(self.branch_condition_encoder.parameters())
+        if self.dko is not None:
+            params += list(self.dko.parameters())
+        return params
 
     # =========================
     # Pair feature builders
@@ -145,7 +185,147 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             return 'A'
         return branch
 
+    # =========================
+    # DKO
+    # =========================
+    def _reduce_feature_loss(self, target: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
+        loss = F.mse_loss(target, pred, reduction='none')
+        loss = loss.reshape(loss.shape[0], -1).mean(dim=1)
+        return loss.mean()
 
+    def augment_images(
+        self,
+        images: torch.Tensor,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        if images.dim() != 6 or images.shape[1] != 2 or images.shape[2] != 2:
+            raise RuntimeError(f"image must be (B,2,2,3,H,W), got shape={tuple(images.shape)}")
+
+        if iaa is None:
+            return self._augment_images_torch(images)
+
+        imgshape = images.shape
+        device = images.device
+        datatype = images.dtype
+        img_augmenter = iaa.Sequential(
+            [
+                iaa.CropAndPad(percent=np.random.uniform(-self.koopman_aug_crop_pad, self.koopman_aug_crop_pad)),
+                iaa.Fliplr(np.random.choice([0, 1], p=[0.5, 0.5])),
+                iaa.Affine(rotate=np.random.uniform(-self.koopman_aug_rotate, self.koopman_aug_rotate)),
+                iaa.AdditiveGaussianNoise(scale=self.koopman_aug_noise_scale),
+                iaa.Multiply(np.random.uniform(self.koopman_aug_brightness_min, self.koopman_aug_brightness_max)),
+            ]
+        )
+
+        input_images = images.permute(0, 1, 2, 4, 5, 3).reshape(-1, imgshape[4], imgshape[5], imgshape[3])
+        input_images = input_images.detach().cpu().numpy()
+        aug_images = img_augmenter(images=input_images)
+        aug_images = np.clip(aug_images, 0.0, 1.0)
+
+        aug_images = torch.tensor(aug_images, dtype=datatype, device=device)
+        aug_images = aug_images.reshape(imgshape[0], imgshape[1], imgshape[2], imgshape[4], imgshape[5], imgshape[3])
+        aug_images = aug_images.permute(0, 1, 2, 5, 3, 4)
+
+        curr_vis_dict = {
+            'front_rgb': aug_images[:, 0, 0],
+            'wrist_rgb': aug_images[:, 0, 1],
+        }
+        next_vis_dict = {
+            'front_rgb': aug_images[:, 1, 0],
+            'wrist_rgb': aug_images[:, 1, 1],
+        }
+        return curr_vis_dict, next_vis_dict
+
+    def _augment_images_torch(
+        self,
+        images: torch.Tensor,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        imgshape = images.shape
+        h = imgshape[4]
+        w = imgshape[5]
+        aug_images = images.reshape(-1, imgshape[3], h, w)
+
+        crop_pad_ratio = float(np.random.uniform(-self.koopman_aug_crop_pad, self.koopman_aug_crop_pad))
+        if crop_pad_ratio >= 0:
+            pad = int(round(crop_pad_ratio * min(h, w)))
+            if pad > 0:
+                aug_images = F.pad(aug_images, (pad, pad, pad, pad), mode='replicate')
+                top = int(torch.randint(0, 2 * pad + 1, (1,), device=aug_images.device).item())
+                left = int(torch.randint(0, 2 * pad + 1, (1,), device=aug_images.device).item())
+                aug_images = aug_images[:, :, top:top + h, left:left + w]
+        else:
+            crop = int(round((-crop_pad_ratio) * min(h, w)))
+            if crop > 0 and (2 * crop) < min(h, w):
+                aug_images = aug_images[:, :, crop:h - crop, crop:w - crop]
+                aug_images = F.interpolate(aug_images, size=(h, w), mode='bilinear', align_corners=False)
+
+        if np.random.choice([0, 1], p=[0.5, 0.5]) == 1:
+            aug_images = torch.flip(aug_images, dims=(-1,))
+
+        angle = float(np.random.uniform(-self.koopman_aug_rotate, self.koopman_aug_rotate)) * np.pi / 180.0
+        cos_theta = float(np.cos(angle))
+        sin_theta = float(np.sin(angle))
+        theta = torch.tensor(
+            [[cos_theta, -sin_theta, 0.0], [sin_theta, cos_theta, 0.0]],
+            dtype=aug_images.dtype,
+            device=aug_images.device,
+        ).unsqueeze(0).repeat(aug_images.shape[0], 1, 1)
+        grid = F.affine_grid(theta, aug_images.size(), align_corners=False)
+        aug_images = F.grid_sample(
+            aug_images,
+            grid,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=False,
+        )
+
+        aug_images = aug_images + self.koopman_aug_noise_scale * torch.randn_like(aug_images)
+        brightness = float(np.random.uniform(self.koopman_aug_brightness_min, self.koopman_aug_brightness_max))
+        aug_images = (aug_images * brightness).clamp(0.0, 1.0)
+
+        aug_images = aug_images.reshape(imgshape[0], imgshape[1], imgshape[2], imgshape[3], h, w)
+        curr_vis_dict = {
+            'front_rgb': aug_images[:, 0, 0],
+            'wrist_rgb': aug_images[:, 0, 1],
+        }
+        next_vis_dict = {
+            'front_rgb': aug_images[:, 1, 0],
+            'wrist_rgb': aug_images[:, 1, 1],
+        }
+        return curr_vis_dict, next_vis_dict
+
+    def _compute_koopman_aux(
+        self,
+        common: Dict[str, Optional[torch.Tensor]],
+    ) -> Dict[str, torch.Tensor]:
+        if self.dko is None:
+            raise RuntimeError('DKO auxiliary loss requested but self.dko is not initialized.')
+
+        vis_enc_pair = common['vis_enc_pair']
+        image_pair = common['image_pair']
+        if vis_enc_pair is None:
+            raise RuntimeError('Fusion Koopman auxiliary loss requires vis_enc_pair.')
+        if image_pair is None:
+            raise RuntimeError('Fusion Koopman auxiliary loss requires image_pair.')
+
+        curr_vis_enc = vis_enc_pair[:, 0]
+        next_vis_enc = vis_enc_pair[:, 1]
+
+        pred_next_vis_enc, curr_latent_acts = self.dko(curr_vis_enc, latent_act=None)
+        koop_consis_kvp = self._reduce_feature_loss(next_vis_enc, pred_next_vis_enc)
+
+        if self.koopman_use_augmentation:
+            aug_curr_vis_dict, aug_next_vis_dict = self.augment_images(image_pair)
+            aug_curr_vis_enc = self.branch_condition_encoder.vis_encoder(aug_curr_vis_dict)
+            aug_next_vis_enc = self.branch_condition_encoder.vis_encoder(aug_next_vis_dict)
+            pred_aug_next_vis_enc = self.dko(aug_curr_vis_enc, latent_act=curr_latent_acts)
+            koop_consis_fea = self._reduce_feature_loss(aug_next_vis_enc, pred_aug_next_vis_enc)
+        else:
+            koop_consis_fea = torch.zeros((), dtype=curr_vis_enc.dtype, device=curr_vis_enc.device)
+
+        return {
+            'koop_consis_kvp': koop_consis_kvp,
+            'koop_consis_fea': koop_consis_fea,
+        }
 
     # =========================
     # Unified condition prep
@@ -182,11 +362,14 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             subgoal = torch.zeros((B, self.subgoal_dim), dtype=state.dtype, device=state.device)    ##这个原版是None
         subgoal_zero = torch.zeros_like(subgoal)
 
-        # Pair-style D3P placeholders.##################
-        subgoal_pair = torch.stack((subgoal, subgoal), dim=1)  # (B, 2, subgoal_dim=8=6爪pos+2接触)
-
         image_pair = raw_batch['image'] if 'image' in raw_batch else None
         qpos_pair = raw_batch['qpos'] if 'qpos' in raw_batch else None  ## (B, 2时间, 9=7jiont+2爪宽)
+        # Pair-style D3P subgoal pair. Prefer explicit (t, t+h) pair from dataset.
+        if 'd3p_subgoal_pair' in raw_batch:
+            subgoal_pair = self.normalizer.normalize({'subgoal': raw_batch['d3p_subgoal_pair']}, self.subgoal_dim_nocont)['subgoal']
+        else:
+            subgoal_pair = torch.stack((subgoal, subgoal), dim=1)  # rollout / legacy fallback
+        
         d3p_action_pair = (
             self.normalizer.normalize({'action': raw_batch['d3p_action_pair']})['action']
             if 'd3p_action_pair' in raw_batch else None
@@ -213,6 +396,14 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
                         "act_is_pad_pair shape mismatch with d3p_action_pair: "
                         f"{tuple(act_is_pad_pair.shape)} vs {tuple(d3p_action_pair.shape)}"
                     )
+        if subgoal_pair.dim() != 3:
+            raise RuntimeError(f"subgoal_pair must be (B,2,subgoal_dim), got shape={tuple(subgoal_pair.shape)}")
+        if subgoal_pair.shape[1] != 2:
+            raise RuntimeError(f"subgoal_pair second dim must be 2, got {subgoal_pair.shape[1]}")
+        if subgoal_pair.shape[-1] != self.subgoal_dim:
+            raise RuntimeError(
+                f"subgoal_pair subgoal dim mismatch: got {subgoal_pair.shape[-1]}, expected {self.subgoal_dim}"
+            )
 
         vis_enc_pair = self.branch_condition_encoder.encode_vis_pair(image_pair)
 
@@ -243,6 +434,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             
             'vis_enc_pair': vis_enc_pair,
             'fea_fuse_pair': fea_fuse_pair,
+            'image_pair': image_pair,
 
             'd3p_action_pair': d3p_action_pair,
             'act_is_pad_pair': act_is_pad_pair,
@@ -566,7 +758,26 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         common = self._prepare_branch_inputs(batch)
         branch = self._select_train_branch(common)
         cond = self._build_cond_by_branch(branch, common)
-        return self._compute_loss_actor_from_cond(branch=branch, cond=cond, common=common)
+        actor_loss, bc_loss, q_loss = self._compute_loss_actor_from_cond(branch=branch, cond=cond, common=common)
+
+        if self.use_koopman_aux and branch in ('B1', 'B2'):
+            koop_aux = self._compute_koopman_aux(common)
+            actor_loss = actor_loss + self.koopman_kvp_weight * koop_aux['koop_consis_kvp']
+            actor_loss = actor_loss + self.koopman_fea_weight * koop_aux['koop_consis_fea']
+            self._last_actor_aux_logs = {
+                'train_koop_consis_kvp': float(koop_aux['koop_consis_kvp'].detach().item()),
+                'train_koop_consis_fea': float(koop_aux['koop_consis_fea'].detach().item()),
+            }
+        else:
+            self._last_actor_aux_logs = {
+                'train_koop_consis_kvp': 0.0,
+                'train_koop_consis_fea': 0.0,
+            }
+
+        return actor_loss, bc_loss, q_loss
+
+    def get_last_actor_aux_logs(self) -> Dict[str, float]:
+        return dict(self._last_actor_aux_logs)
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         common = self._prepare_branch_inputs(obs_dict)
