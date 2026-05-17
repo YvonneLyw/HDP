@@ -28,6 +28,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
       - subgoal_pair prefers dataset-provided (t, t+h) subgoals and only falls back to
         duplicating current subgoal when explicit pair data is unavailable.
       - B branch BC loss uses two timestamps (t and t+h) with 0.5/0.5 weighting.
+      - DKO auxiliary loss can be enabled for B branches.
+      - Q loss is only applied on branch A; B branches always train with eta=0.
     """
     # A-only：policy.mode=SINGLE policy.single_branch=A
     # B1-only：policy.mode=SINGLE policy.single_branch=B1
@@ -130,8 +132,9 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
 
     ########## 模型（actor,branch_condition_encoder，dko）参数加入optimizer############ D3P fusion 把actor+ branch_condition_encoder （+dko）一起训
     def get_actor_training_parameters(self):
-        # B-branch actor losses depend on branch_condition_encoder outputs, so it
-        # must be optimized together with the actor during the actor stage.
+        # B-branch actor losses depend on branch_condition_encoder outputs, and
+        # optionally DKO auxiliary losses, so they must be optimized together
+        # during actor stage.
         params = list(self.actor.parameters()) + list(self.branch_condition_encoder.parameters())
         if self.dko is not None:
             params += list(self.dko.parameters())
@@ -700,7 +703,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             step_out = step_t
 
         # ******** q loss ********
-        if self.eta != 0:
+        effective_eta = self.eta if branch == 'A' else 0.0
+        if effective_eta != 0:
             if self.single_step_reverse_diffusion:  # 单次逆扩散，由Xt直接生成X0    ## 一次性反推:x_k到x_0
                 pred_x0_list = []
                 for i in range(B):
@@ -730,9 +734,12 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             else:
                 q_loss = - q2_new_action.mean() / q1_new_action.abs().mean().detach()
 
-            actor_loss = bc_loss + self.eta*q_loss
+            actor_loss = bc_loss + effective_eta * q_loss
         else:
-            q_loss = torch.tensor(-1, device=self.device)
+            if (branch != 'A') and (self.eta != 0):
+                q_loss = torch.zeros((), device=self.device)
+            else:
+                q_loss = torch.tensor(-1, device=self.device)
             actor_loss = bc_loss
 
         return actor_loss, bc_loss, q_loss

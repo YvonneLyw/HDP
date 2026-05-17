@@ -162,7 +162,7 @@ policy:
   b_branch: B1            # B1 / B2 (mode=SWITCH 时与A做训练切换和rollout选择)
   switch_prob_b: 0.5      # mode=SWITCH 时训练阶段采样 B 分支概率
   d3p_rollout_error_samples: 10
-  use_koopman_aux: false  # B分支是否叠加DKO辅助loss（koop_consis_kvp / koop_consis_fea）
+  use_koopman_aux: true  # B分支是否叠加DKO辅助loss（koop_consis_kvp / koop_consis_fea）
   extra_cond_dim: ${extra_cond_dim}  
   image_feat_dim: 64
   qpos_feat_dim: 9                     #########################新增############
