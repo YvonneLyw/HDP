@@ -864,22 +864,22 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
 
         with torch.no_grad():
             action_A_norm = self.conditional_sample_action(cond=cond_A_run, model=None)
-        err_A = self.compute_test_time_ddpm_error(cond=cond_A_run, action_norm=action_A_norm)
+        err_A = self.compute_test_time_ddpm_error(cond=cond_A_run, action_norm=action_A_norm)   ## (B,1)
 
         ########################B分支############################
         cond_B = self._build_cond_by_branch(self.b_branch, common)
         cond_B_run = self._rollout_cond_from_branch_cond(cond_B)
         with torch.no_grad():
             action_B_norm = self.conditional_sample_action(cond=cond_B_run, model=None)
-        err_B = self.compute_test_time_ddpm_error(cond=cond_B_run, action_norm=action_B_norm)
+        err_B = self.compute_test_time_ddpm_error(cond=cond_B_run, action_norm=action_B_norm)   ## (B,1)
 
         select_B = (err_B < err_A).view(-1, 1, 1)   ## 选 B：True，选 A：False 
         action_sel_norm = torch.where(select_B, action_B_norm, action_A_norm)
 
-        out = self._format_action_from_normalized(action_sel_norm)  ## 'action_pred'完整预测AC，'action'真实要执行的 action 段
-        out['branch_err_A'] = err_A.unsqueeze(-1)
-        out['branch_err_B'] = err_B.unsqueeze(-1)
-        out['selected_branch'] = select_B[:, 0, 0].to(dtype=action_sel_norm.dtype).unsqueeze(-1)
+        out = self._format_action_from_normalized(action_sel_norm)  ## 'action_pred'完整预测AC，'action'真实要执行的 action 段 (B,AC长=4,dimA）
+        out['branch_err_A'] = err_A.unsqueeze(-1)   ## (B,1)
+        out['branch_err_B'] = err_B.unsqueeze(-1)   ## (B,1)
+        out['selected_branch'] = select_B[:, 0, 0].to(dtype=action_sel_norm.dtype).unsqueeze(-1)    ## (B,1) e.g.[1,0,1,1,0,0...]
         return out
 
     # =========================

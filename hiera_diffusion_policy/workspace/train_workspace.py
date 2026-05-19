@@ -451,7 +451,8 @@ class TrainWorkspace(BaseWorkspace):
                                 'lr_actor': lr_scheduler_actor.get_last_lr()[0],
                                 'eta': cfg.policy.eta
                             }
-                            if hasattr(self.model, 'get_last_actor_aux_logs'):
+                            
+                            if hasattr(self.model, 'get_last_actor_aux_logs'):          ## DKO两loss####
                                 step_log.update(self.model.get_last_actor_aux_logs())
 
                             is_last_batch = (batch_idx == (len(train_dataloader)-1))
@@ -507,7 +508,14 @@ class TrainWorkspace(BaseWorkspace):
                         with torch.no_grad():
                             batch = train_sampling_batch    # Tensor, no norm
 
-                            #################### 做一次采样评估并记日志：新增 pred_out#######################
+                            ############ 使用fusion的predict_action做一次train采样评估 增加两分支日志########
+                            # pred_out: = {
+                            #     "action_pred": action,          # full predicted action sequence
+                            #     "action": action_run,           # action segment to execute
+                            #     "branch_err_A": branch_err_A,   # branch A reconstruction / DDPM error
+                            #     "branch_err_B": branch_err_B,   # branch B reconstruction / DDPM error
+                            #     "selected_branch": selected_branch,
+                            # 
                             ## pred_action = self.model.predict_action(batch)['action_pred']
                             pred_out = self.model.predict_action(batch)
                             pred_action = pred_out['action_pred']

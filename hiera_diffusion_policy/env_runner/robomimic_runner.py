@@ -484,17 +484,17 @@ class RobomimicRunner(BasePcdRunner):
                 # device_transfer
                 np_action_dict = dict_apply(action_dict,
                     lambda x: x.detach().to('cpu').numpy())
-                ## 从 policy 输出：err等 取诊断字段做日志聚合#########################
+                ## 从 policy 输出：err等 取诊断字段做日志聚合（平均28个env)########################
                 if 'branch_err_A' in np_action_dict:
-                    branch_err_A_trace.append(float(np_action_dict['branch_err_A'].mean()))
+                    branch_err_A_trace.append(float(np_action_dict['branch_err_A'].mean()))         ## (B,1) -> 标量 -> (循环次数,1)
                 if 'branch_err_B' in np_action_dict:
-                    branch_err_B_trace.append(float(np_action_dict['branch_err_B'].mean()))
+                    branch_err_B_trace.append(float(np_action_dict['branch_err_B'].mean()))         ## (B,1) -> 标量 -> (循环次数,1)
                 if 'selected_branch' in np_action_dict:
-                    selected_branch_trace.append(float(np_action_dict['selected_branch'].mean()))
+                    selected_branch_trace.append(float(np_action_dict['selected_branch'].mean()))   ## (B,1) -> 标量 -> (循环次数,1)
 
                 # handle latency_steps, we discard the first n_latency_steps actions
                 # to simulate latency
-                action = np_action_dict['action'][:,self.n_latency_steps:]     ## 删掉前latency步a 
+                action = np_action_dict['action'][:,self.n_latency_steps:]     ## 删掉前latency步a    ## (B,AC长，dim_a)
                 if not np.all(np.isfinite(action)):         ##避免策略输出 NaN/Inf，防止环境崩掉。
                     print(action)
                     raise RuntimeError("Nan or Inf action")
@@ -559,13 +559,14 @@ class RobomimicRunner(BasePcdRunner):
             value = np.mean(value)
             log_data[name] = value
 
-        ###### 记录policy输出########################
+        ###### 记录此次rollout（平均整条traj）的policy两分支输出########################
         if len(branch_err_A_trace) > 0:
-            log_data['branch_err_A_mean'] = float(np.mean(branch_err_A_trace))
+            log_data['branch_err_A_mean'] = float(np.mean(branch_err_A_trace))          ## (循环次数,1) -> 标量
         if len(branch_err_B_trace) > 0:
-            log_data['branch_err_B_mean'] = float(np.mean(branch_err_B_trace))
+            log_data['branch_err_B_mean'] = float(np.mean(branch_err_B_trace))          ## (循环次数,1) -> 标量
         if len(selected_branch_trace) > 0:
-            log_data['selected_branch_B_ratio'] = float(np.mean(selected_branch_trace))
+            log_data['selected_branch_B_ratio'] = float(np.mean(selected_branch_trace)) ## (循环次数,1) -> 标量
+            ## rollout内各step的选B率（不平均整条traj）
             selected_branch_table = wandb.Table(
                 data=[
                     [int(step_idx), float(step_ratio)]
