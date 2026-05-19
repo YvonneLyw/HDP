@@ -233,7 +233,7 @@ class HieraDiffusionPolicy(BasePcdPolicy):
         B = state.shape[0]              ## B：batch size（一次并行生成多少条A）
         shape = (B, self.horizon, self.action_dim)
         action = torch.randn(size=shape, dtype=self.dtype, device=self.device)     ##纯噪A_k
-        timesteps = self.noise_scheduler_actor.timesteps        ## scheduler 的时间步序列k[999, 998, ..., 0]
+        timesteps = self.noise_scheduler_actor.timesteps        ## scheduler 的时间步序列k[99, 98, ..., 0]
             ## DP model逐步（k,k-1,...,0)反向去噪      
             ## 输入：DP条件（观测/状态/子目标）+ 当前 noisy action：A_k + 当前扩散时间步：t（即k）
             ## 同一个标量扩散时间步：t（即k） 作用于整个 batch
@@ -381,7 +381,7 @@ class HieraDiffusionPolicy(BasePcdPolicy):
         # ******** bc loss ********
         # diffusion     ## （batchsize个样本）一次加噪（timesteps：batchsize 个随机 k）
         timesteps = torch.randint(
-            0, self.noise_scheduler_actor.config.num_train_timesteps, # 100     ##总步数K=100
+            0, self.noise_scheduler_actor.config.num_train_timesteps, # 100     ## 10   ##总步数K=10
             (B,), device=self.device
         ).long()
         # add noise to action   ## batch内不同样本 使用不同扩散时间步：t（即k）

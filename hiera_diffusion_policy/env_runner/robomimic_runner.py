@@ -565,9 +565,20 @@ class RobomimicRunner(BasePcdRunner):
         if len(branch_err_B_trace) > 0:
             log_data['branch_err_B_mean'] = float(np.mean(branch_err_B_trace))
         if len(selected_branch_trace) > 0:
-            selected_b_ratio = float(np.mean(selected_branch_trace))
-            log_data['selected_branch_B_ratio'] = selected_b_ratio
-            log_data['selected_branch_A_ratio'] = 1.0 - selected_b_ratio
+            log_data['selected_branch_B_ratio'] = float(np.mean(selected_branch_trace))
+            selected_branch_table = wandb.Table(
+                data=[
+                    [int(step_idx), float(step_ratio)]
+                    for step_idx, step_ratio in enumerate(selected_branch_trace)
+                ],
+                columns=['rollout_step', 'selected_branch_B_ratio'],
+            )
+            log_data['selected_branch_B_ratio_trace'] = wandb.plot.line(
+                selected_branch_table,
+                'rollout_step',
+                'selected_branch_B_ratio',
+                title='Selected Branch B Ratio Trace',
+            )
 
         return log_data
     

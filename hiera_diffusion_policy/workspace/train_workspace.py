@@ -520,7 +520,6 @@ class TrainWorkspace(BaseWorkspace):
                             if 'selected_branch' in pred_out:
                                 selected_b_ratio = pred_out['selected_branch'].mean().item()
                                 step_log['train_selected_branch_B_ratio'] = selected_b_ratio
-                                step_log['train_selected_branch_A_ratio'] = 1.0 - selected_b_ratio
                             
                             # release RAM
                             del batch

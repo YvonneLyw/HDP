@@ -152,12 +152,6 @@ class BranchConditionEncoder(nn.Module):
             fea_vis_dim=self.vis_dim,
             out_dim=self.cond_hidden_dim,
         )
-
-        self.b1_vis_proj = nn.Sequential(
-            nn.Linear(self.vis_dim, self.cond_hidden_dim),
-            nn.Mish(),
-            nn.Linear(self.cond_hidden_dim, self.cond_hidden_dim),
-        )
         
         in_dim = self.cond_hidden_dim + self.subgoal_dim
         self.branch_cond_encoder = nn.Sequential(
@@ -208,11 +202,10 @@ class BranchConditionEncoder(nn.Module):
 
     def build_b1_extra_cond_pair(
         self,
-        vis_enc_pair: torch.Tensor,
+        latent_act_pair: torch.Tensor,
         subgoal_pair: torch.Tensor,
     ) -> torch.Tensor:
-        vis_hidden_pair = self.b1_vis_proj(vis_enc_pair)   # (B,2,cond_hidden_dim)
-        b1_input = torch.cat((vis_hidden_pair, subgoal_pair), dim=-1)
+        b1_input = torch.cat((latent_act_pair, subgoal_pair), dim=-1)
         return self.branch_cond_encoder(b1_input)
 
     def build_b2_extra_cond_pair(

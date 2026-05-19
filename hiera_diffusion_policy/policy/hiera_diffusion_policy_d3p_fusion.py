@@ -20,7 +20,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
 
     Branch contracts:
       - A : state/pcd real, extra_cond=zeros
-      - B1: state/pcd zero, dual-time extra_cond from (vis_enc, subgoal)
+      - B1: state/pcd zero, dual-time extra_cond from (latent_act, subgoal)
       - B2: state/pcd zero, dual-time extra_cond from (fea_fuse, subgoal)
 
     Notes:
@@ -28,6 +28,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
       - subgoal_pair prefers dataset-provided (t, t+h) subgoals and only falls back to
         duplicating current subgoal when explicit pair data is unavailable.
       - B branch BC loss uses two timestamps (t and t+h) with 0.5/0.5 weighting.
+      - B1 uses DKO latent acts plus subgoal to build extra_cond_pair when DKO is enabled.
       - DKO auxiliary loss can be enabled for B branches.
       - Q loss is only applied on branch A; B branches always train with eta=0.
     """
@@ -313,7 +314,15 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         curr_vis_enc = vis_enc_pair[:, 0]
         next_vis_enc = vis_enc_pair[:, 1]
 
-        pred_next_vis_enc, curr_latent_acts = self.dko(curr_vis_enc, latent_act=None)
+        latent_act_pair = common.get('b1_latent_act_pair', None)
+        if latent_act_pair is not None:
+            curr_latent_acts = latent_act_pair[:, 0]
+            next_latent_acts = latent_act_pair[:, 1]
+            self.dko.enable_kv_grad(True)
+            pred_next_vis_enc = self.dko.K(curr_vis_enc.detach() + self.dko.V(curr_latent_acts))
+        else:
+            pred_next_vis_enc, curr_latent_acts = self.dko(curr_vis_enc, latent_act=None)
+            next_latent_acts = self.dko.get_latent_act(next_vis_enc)
         koop_consis_kvp = self._reduce_feature_loss(next_vis_enc, pred_next_vis_enc)
 
         if self.koopman_use_augmentation:
@@ -326,6 +335,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             koop_consis_fea = torch.zeros((), dtype=curr_vis_enc.dtype, device=curr_vis_enc.device)
 
         return {
+            'curr_latent_acts': curr_latent_acts,
+            'next_latent_acts': next_latent_acts,
             'koop_consis_kvp': koop_consis_kvp,
             'koop_consis_fea': koop_consis_fea,
         }
@@ -437,6 +448,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             
             'vis_enc_pair': vis_enc_pair,
             'fea_fuse_pair': fea_fuse_pair,
+            'b1_latent_act_pair': None,
             'image_pair': image_pair,
 
             'd3p_action_pair': d3p_action_pair,
@@ -486,6 +498,29 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
 
         self._debug_checked_once = True
 
+    def _ensure_b1_latent_act_pair(
+        self,
+        common: Dict[str, Optional[torch.Tensor]],
+    ) -> torch.Tensor:
+        latent_act_pair = common.get('b1_latent_act_pair', None)
+        if latent_act_pair is not None:
+            return latent_act_pair
+
+        if self.dko is None:
+            raise RuntimeError('B1 requires use_koopman_aux=true because it uses DKO latent acts.')
+        if common['vis_enc_pair'] is None:
+            raise RuntimeError('B1 requires vis_enc_pair, but image is missing.')
+
+        latent_act_pair = torch.stack(
+            (
+                self.dko.get_latent_act(common['vis_enc_pair'][:, 0]),
+                self.dko.get_latent_act(common['vis_enc_pair'][:, 1]),
+            ),
+            dim=1,
+        )
+        common['b1_latent_act_pair'] = latent_act_pair
+        return latent_act_pair
+
     def _build_cond_by_branch(
         self,
         branch: str,
@@ -501,8 +536,9 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         elif branch == 'B1':
             if common['vis_enc_pair'] is None:
                 raise RuntimeError('B1 requires vis_enc_pair, but image is missing.')
+            latent_act_pair = self._ensure_b1_latent_act_pair(common)
             extra_cond_pair = self.branch_condition_encoder.build_b1_extra_cond_pair(
-                common['vis_enc_pair'],
+                latent_act_pair,
                 common['subgoal_pair'],
             )
             cond = {
@@ -767,8 +803,16 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         cond = self._build_cond_by_branch(branch, common)
         actor_loss, bc_loss, q_loss = self._compute_loss_actor_from_cond(branch=branch, cond=cond, common=common)
 
+        # DKO
+        koop_aux = None
         if self.use_koopman_aux and branch in ('B1', 'B2'):
             koop_aux = self._compute_koopman_aux(common)
+            if branch == 'B1':
+                common['b1_latent_act_pair'] = torch.stack(
+                    (koop_aux['curr_latent_acts'], koop_aux['next_latent_acts']),
+                    dim=1,
+                )
+        if koop_aux is not None:
             actor_loss = actor_loss + self.koopman_kvp_weight * koop_aux['koop_consis_kvp']
             actor_loss = actor_loss + self.koopman_fea_weight * koop_aux['koop_consis_fea']
             self._last_actor_aux_logs = {
@@ -832,7 +876,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         select_B = (err_B < err_A).view(-1, 1, 1)   ## 选 B：True，选 A：False 
         action_sel_norm = torch.where(select_B, action_B_norm, action_A_norm)
 
-        out = self._format_action_from_normalized(action_sel_norm)
+        out = self._format_action_from_normalized(action_sel_norm)  ## 'action_pred'完整预测AC，'action'真实要执行的 action 段
         out['branch_err_A'] = err_A.unsqueeze(-1)
         out['branch_err_B'] = err_B.unsqueeze(-1)
         out['selected_branch'] = select_B[:, 0, 0].to(dtype=action_sel_norm.dtype).unsqueeze(-1)
