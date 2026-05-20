@@ -367,6 +367,9 @@ class RobomimicRunner(BasePcdRunner):
         branch_err_A_trace = list()
         branch_err_B_trace = list()
         selected_branch_trace = list()
+        branch_select_source_err_trace = list()
+        branch_select_source_q_trace = list()
+        branch_select_source_hybrid_linear_trace = list()
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
@@ -491,6 +494,11 @@ class RobomimicRunner(BasePcdRunner):
                     branch_err_B_trace.append(float(np_action_dict['branch_err_B'].mean()))         ## (B,1) -> 标量 -> (循环次数,1)
                 if 'selected_branch' in np_action_dict:
                     selected_branch_trace.append(float(np_action_dict['selected_branch'].mean()))   ## (B,1) -> 标量 -> (循环次数,1)
+                if 'branch_select_source' in np_action_dict:
+                    branch_select_source = np_action_dict['branch_select_source']
+                    branch_select_source_err_trace.append(float((branch_select_source == 0).mean()))
+                    branch_select_source_q_trace.append(float((branch_select_source == 1).mean()))
+                    branch_select_source_hybrid_linear_trace.append(float((branch_select_source == 2).mean()))
 
                 # handle latency_steps, we discard the first n_latency_steps actions
                 # to simulate latency
@@ -579,6 +587,14 @@ class RobomimicRunner(BasePcdRunner):
                 'rollout_step',
                 'selected_branch_B_ratio',
                 title='Selected Branch B Ratio Trace',
+            )
+        if len(branch_select_source_err_trace) > 0:
+            log_data['branch_select_source_err_ratio'] = float(np.mean(branch_select_source_err_trace))
+        if len(branch_select_source_q_trace) > 0:
+            log_data['branch_select_source_q_ratio'] = float(np.mean(branch_select_source_q_trace))
+        if len(branch_select_source_hybrid_linear_trace) > 0:
+            log_data['branch_select_source_hybrid_linear_ratio'] = float(
+                np.mean(branch_select_source_hybrid_linear_trace)
             )
 
         return log_data

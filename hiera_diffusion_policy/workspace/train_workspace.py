@@ -525,6 +525,17 @@ class TrainWorkspace(BaseWorkspace):
                                 step_log['train_branch_err_A'] = pred_out['branch_err_A'].mean().item()
                             if 'branch_err_B' in pred_out:
                                 step_log['train_branch_err_B'] = pred_out['branch_err_B'].mean().item()
+                            if 'branch_select_source' in pred_out:
+                                branch_select_source = pred_out['branch_select_source']
+                                step_log['train_branch_select_source_err_ratio'] = (
+                                    (branch_select_source == 0).float().mean().item()
+                                )
+                                step_log['train_branch_select_source_q_ratio'] = (
+                                    (branch_select_source == 1).float().mean().item()
+                                )
+                                step_log['train_branch_select_source_hybrid_linear_ratio'] = (
+                                    (branch_select_source == 2).float().mean().item()
+                                )
                             if 'selected_branch' in pred_out:
                                 selected_b_ratio = pred_out['selected_branch'].mean().item()
                                 step_log['train_selected_branch_B_ratio'] = selected_b_ratio

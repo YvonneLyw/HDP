@@ -30,7 +30,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
       - B branch BC loss uses two timestamps (t and t+h) with 0.5/0.5 weighting.
       - B1 uses DKO latent acts plus subgoal to build extra_cond_pair when DKO is enabled.
       - DKO auxiliary loss can be enabled for B branches.
-      - Q loss is only applied on branch A; B branches always train with eta=0.
+      - Q loss is always applied on branch A; B branches can optionally share the same Q loss.
+      - SWITCH branch arbitration can use diffusion error, critic score, or hybrid selectors.
     """
     # A-only：policy.mode=SINGLE policy.single_branch=A
     # B1-only：policy.mode=SINGLE policy.single_branch=B1
@@ -48,6 +49,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         d3p_rollout_error_samples: int = 10,
         fusion_debug_checks: bool = True,
         use_koopman_aux: bool = False,
+        b_branch_use_q_loss: bool = False,
+        branch_selector: str = 'err',   ##['err','q','hybrid_gate','hybrid_linear']
         extra_cond_dim: int = 64,
         image_feat_dim: int = 64,
         qpos_feat_dim: int = 9,
@@ -66,6 +69,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         self.fusion_debug_checks = bool(fusion_debug_checks)
         self._debug_checked_once = False
         self.use_koopman_aux = bool(use_koopman_aux)
+        self.b_branch_use_q_loss = bool(b_branch_use_q_loss)
+        self.branch_selector = str(branch_selector).lower()
 
         self.extra_cond_dim = int(extra_cond_dim)
         self.image_feat_dim = int(image_feat_dim)  # per-view output dim
@@ -84,6 +89,11 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             raise ValueError(f"d3p_query_every is fixed to 4 in current fusion stage, got {self.d3p_query_every}")
         if self.d3p_rollout_error_samples < 1:
             raise ValueError(f"d3p_rollout_error_samples must be >= 1, got {self.d3p_rollout_error_samples}")
+        if self.branch_selector not in ('err', 'q', 'hybrid_gate', 'hybrid_linear'):
+            raise ValueError(
+                "branch_selector must be one of ['err','q','hybrid_gate','hybrid_linear'], "
+                f"got {self.branch_selector}"
+            )
 
         actor_extra_cond_dim = int(getattr(self.actor, 'extra_cond_dim', 0))
         if actor_extra_cond_dim != self.extra_cond_dim:
@@ -739,7 +749,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             step_out = step_t
 
         # ******** q loss ********
-        effective_eta = self.eta if branch == 'A' else 0.0
+        effective_eta = self.eta if (branch == 'A' or self.b_branch_use_q_loss) else 0.0
         if effective_eta != 0:
             if self.single_step_reverse_diffusion:  # 单次逆扩散，由Xt直接生成X0    ## 一次性反推:x_k到x_0
                 pred_x0_list = []
@@ -771,7 +781,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
                 q_loss = - q2_new_action.mean() / q1_new_action.abs().mean().detach()
 
             actor_loss = bc_loss + effective_eta * q_loss
-        else:
+        else:   ## B不使用Q，无q_loss
             if (branch != 'A') and (self.eta != 0):
                 q_loss = torch.zeros((), device=self.device)
             else:
@@ -830,6 +840,89 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
     def get_last_actor_aux_logs(self) -> Dict[str, float]:
         return dict(self._last_actor_aux_logs)
 
+    @torch.no_grad()
+    def _compute_branch_q_score(
+        self,
+        common: Dict[str, Optional[torch.Tensor]],
+        action_norm: torch.Tensor,
+    ) -> torch.Tensor:
+        B = action_norm.shape[0]
+        q_action = action_norm[:, self.observation_history_num-1:
+                                  self.observation_history_num-1+self.Tr].reshape((B, -1))
+        q1, q2 = self.critic_target(
+            common['pcd'], common['state'], common['subgoal'], q_action
+        )
+        q1 = q1.squeeze(-1)
+        q2 = q2.squeeze(-1)
+        return torch.minimum(q1, q2)
+
+    @torch.no_grad()
+    def _select_branch_in_switch(
+        self,
+        common: Dict[str, Optional[torch.Tensor]],
+        err_A: torch.Tensor,
+        err_B: torch.Tensor,
+        action_A_norm: torch.Tensor,
+        action_B_norm: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        if self.branch_selector == 'err':
+            select_B = (err_B < err_A)
+            select_score_A = -err_A
+            select_score_B = -err_B
+            select_source = torch.zeros_like(err_A, dtype=torch.long)   # 0 = 比较 diffusion errors
+        else:
+            q_A = self._compute_branch_q_score(common, action_A_norm)
+            q_B = self._compute_branch_q_score(common, action_B_norm)
+
+            if self.branch_selector == 'q':
+                select_B = q_B > q_A
+                select_score_A = q_A
+                select_score_B = q_B
+                # 1 = 比较 critic Q scores
+                select_source = torch.ones_like(err_A, dtype=torch.long)
+            elif self.branch_selector == 'hybrid_gate':
+                err_scale = (0.5 * (err_A.abs() + err_B.abs())).clamp_min(1e-6)
+                err_rel_gap = (err_A - err_B).abs() / err_scale     ## err_A和err_B的差距
+
+                select_B_err = (err_B < err_A)
+                select_B_q = (q_B > q_A)
+                err_gate_ratio = 0.25
+                use_err = err_rel_gap > err_gate_ratio
+                
+                select_B = torch.where(use_err, select_B_err, select_B_q)
+                select_score_A = torch.where(use_err, -err_A, q_A)
+                select_score_B = torch.where(use_err, -err_B, q_B)
+                select_source = torch.where(
+                    use_err,
+                    torch.zeros_like(err_A, dtype=torch.long),  # 0 = 比较 diffusion errors
+                    torch.ones_like(err_A, dtype=torch.long),   # 1 = 比较 critic Q scores
+                )
+            else:
+                q_weight = 1.0
+                err_weight = 1.0
+                q_scale = torch.maximum(
+                    torch.maximum(q_A.abs(), q_B.abs()),
+                    torch.full_like(q_A, 1e-6),
+                )
+                err_scale = torch.maximum(
+                    torch.maximum(err_A.abs(), err_B.abs()),
+                    torch.full_like(err_A, 1e-6),
+                )
+                score_A = q_weight * (q_A / q_scale) - err_weight * (err_A / err_scale)
+                score_B = q_weight * (q_B / q_scale) - err_weight * (err_B / err_scale)
+                select_B = score_B > score_A
+                select_score_A = score_A
+                select_score_B = score_B
+                # 2 = 比较 hybrid linear score (Q and err combined)
+                select_source = torch.full_like(err_A, 2, dtype=torch.long)
+
+        return {
+            'select_B': select_B.view(-1, 1, 1),
+            'select_score_A': select_score_A,
+            'select_score_B': select_score_B,
+            'select_source': select_source,
+        }
+
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         common = self._prepare_branch_inputs(obs_dict)
         resolved_b = self._resolve_branch(self.b_branch, common)
@@ -840,7 +933,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             cond_run = self._rollout_cond_from_branch_cond(cond)    ## B分支extra_cond双时刻改单时刻
             with torch.no_grad():
                 action_norm = self.conditional_sample_action(cond=cond_run, model=None)
-            err = self.compute_test_time_ddpm_error(cond=cond_run, action_norm=action_norm)
+            err = self.compute_ddpm_error(cond=cond_run, action_norm=action_norm)
             out = self._format_action_from_normalized(action_norm)  ## 把归一化动作还原成真实动作'action_pred'和'action'
             if branch == 'A':
                 out['branch_err_A'] = err.unsqueeze(-1)
@@ -864,21 +957,33 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
 
         with torch.no_grad():
             action_A_norm = self.conditional_sample_action(cond=cond_A_run, model=None)
-        err_A = self.compute_test_time_ddpm_error(cond=cond_A_run, action_norm=action_A_norm)   ## (B,1)
+        err_A = self.compute_ddpm_error(cond=cond_A_run, action_norm=action_A_norm)   ## (B,1)
 
         ########################B分支############################
         cond_B = self._build_cond_by_branch(self.b_branch, common)
         cond_B_run = self._rollout_cond_from_branch_cond(cond_B)
         with torch.no_grad():
             action_B_norm = self.conditional_sample_action(cond=cond_B_run, model=None)
-        err_B = self.compute_test_time_ddpm_error(cond=cond_B_run, action_norm=action_B_norm)   ## (B,1)
+        err_B = self.compute_ddpm_error(cond=cond_B_run, action_norm=action_B_norm)   ## (B,1)
 
-        select_B = (err_B < err_A).view(-1, 1, 1)   ## 选 B：True，选 A：False 
+        selector_out = self._select_branch_in_switch(
+            common=common,
+            err_A=err_A,
+            err_B=err_B,
+            action_A_norm=action_A_norm,
+            action_B_norm=action_B_norm,
+        )
+        select_B = selector_out['select_B']
         action_sel_norm = torch.where(select_B, action_B_norm, action_A_norm)
 
         out = self._format_action_from_normalized(action_sel_norm)  ## 'action_pred'完整预测AC，'action'真实要执行的 action 段 (B,AC长=4,dimA）
-        out['branch_err_A'] = err_A.unsqueeze(-1)   ## (B,1)
-        out['branch_err_B'] = err_B.unsqueeze(-1)   ## (B,1)
+        out['branch_err_A'] = selector_out['select_score_A'].unsqueeze(-1)   ## (B,1)
+        out['branch_err_B'] = selector_out['select_score_B'].unsqueeze(-1)   ## (B,1)
+        out['branch_select_source'] = selector_out['select_source'].unsqueeze(-1)
+            # branch_select_source codes:
+            #   0 = err-based decision
+            #   1 = q-based decision
+            #   2 = hybrid_linear decision
         out['selected_branch'] = select_B[:, 0, 0].to(dtype=action_sel_norm.dtype).unsqueeze(-1)    ## (B,1) e.g.[1,0,1,1,0,0...]
         return out
 
@@ -886,7 +991,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
     # Inference aggregation hooks
     # =========================
     @torch.no_grad()
-    def compute_test_time_ddpm_error(
+    def compute_ddpm_error(
         self,
         cond: Dict[str, Optional[torch.Tensor]],
         action_norm: torch.Tensor,
