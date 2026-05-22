@@ -482,7 +482,7 @@ class TrainWorkspace(BaseWorkspace):
 
                     # run rollout
                     # ************ 在仿真环境中测试 ************
-                    if (self.epoch_actor % cfg.training.rollout_every) == 0:
+                    if (self.epoch_actor > 0) and ((self.epoch_actor % cfg.training.rollout_every) == 0):
                         runner_log = env_runner.run(self.model)
                         step_log.update(runner_log)
 
@@ -507,6 +507,10 @@ class TrainWorkspace(BaseWorkspace):
                     if (self.epoch_actor % cfg.training.sample_every) == 0:
                         with torch.no_grad():
                             batch = train_sampling_batch    # Tensor, no norm
+                            # Sampling diagnostics should start from a clean inference state.
+                            # Otherwise rollout smoothing cache (e.g. B=28 envs) can leak into
+                            # this fixed train batch (e.g. B=256) and cause shape mismatch.
+                            self.model.reset()
 
                             ############ 使用fusion的predict_action做一次train采样评估 增加两分支日志########
                             # pred_out: = {
