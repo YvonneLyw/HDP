@@ -56,6 +56,9 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         b_branch_use_q_loss: bool = False,
         branch_selector: str = 'err',   ##['err','q','hybrid_gate','hybrid_linear']
         use_action_smoothing: bool = False,
+        use_test_time_aggregation: bool = False,
+        test_time_agg_beta: float = 0.97,
+        test_time_agg_tau: float = 0.1,
         extra_cond_dim: int = 64,
         image_feat_dim: int = 64,
         qpos_feat_dim: int = 9,
@@ -77,6 +80,9 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         self.b_branch_use_q_loss = bool(b_branch_use_q_loss)
         self.branch_selector = str(branch_selector).lower()
         self.use_action_smoothing = bool(use_action_smoothing)
+        self.use_test_time_aggregation = bool(use_test_time_aggregation)
+        self.test_time_agg_beta = float(test_time_agg_beta)
+        self.test_time_agg_tau = float(test_time_agg_tau)
 
         self.extra_cond_dim = int(extra_cond_dim)
         self.image_feat_dim = int(image_feat_dim)  # per-view output dim
@@ -99,6 +105,15 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             raise ValueError(
                 "branch_selector must be one of ['err','q','hybrid_gate','hybrid_linear'], "
                 f"got {self.branch_selector}"
+            )
+        if self.test_time_agg_beta <= 0.0:
+            raise ValueError(f"test_time_agg_beta must be > 0, got {self.test_time_agg_beta}")
+        if self.test_time_agg_tau <= 0.0:
+            raise ValueError(f"test_time_agg_tau must be > 0, got {self.test_time_agg_tau}")
+        if self.use_test_time_aggregation and self.use_action_smoothing:
+            raise ValueError(
+                "use_test_time_aggregation and use_action_smoothing should not be enabled together "
+                "in the first fusion version."
             )
 
         actor_extra_cond_dim = int(getattr(self.actor, 'extra_cond_dim', 0))
@@ -147,6 +162,9 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         else:
             self.dko = None
         self._smoothing_prev_exec_norm: Optional[torch.Tensor] = None   ## 上一次最终执行的动作序列，用于判断这是不是当前 episode 的第一次动作聚合（没有历史执行动作，所以逻辑会特殊处理）
+        self._agg_action_buffer: Optional[torch.Tensor] = None
+        self._agg_weight_buffer: Optional[torch.Tensor] = None
+        self._agg_branch_buffer: Optional[torch.Tensor] = None
 
     ########## 模型（actor,branch_condition_encoder，dko）参数加入optimizer############ D3P fusion 把actor+ branch_condition_encoder （+dko）一起训
     def get_actor_training_parameters(self):
@@ -161,6 +179,9 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
     def reset(self):
         super().reset()
         self._smoothing_prev_exec_norm = None
+        self._agg_action_buffer = None
+        self._agg_weight_buffer = None
+        self._agg_branch_buffer = None
 
     # =========================
     # Pair feature builders
@@ -219,13 +240,6 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             return 0
         return self.observation_history_num - 1
 
-    def _get_selected_action_start(self, select_B: torch.Tensor) -> torch.Tensor:
-        return torch.where(
-            select_B[:, 0, 0],
-            torch.zeros_like(select_B[:, 0, 0], dtype=torch.long),
-            torch.full_like(select_B[:, 0, 0], self.observation_history_num - 1, dtype=torch.long),
-        )
-
     def _extract_action_segment(
         self,
         action_seq: torch.Tensor,
@@ -239,14 +253,14 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
           - Tensor(B,): branch-specific / sample-specific starts
         """
         B, T, D = action_seq.shape
-        length = int(length)
+        length = int(length)    ## 16/4
         if isinstance(start_idx, int):
             start = int(start_idx)
             end = min(start + length, T)
             segment = action_seq[:, start:end]
             if segment.shape[1] == length:
                 return segment
-            pad = segment[:, -1:].expand(-1, length - segment.shape[1], -1)
+            pad = segment[:, -1:].expand(-1, length - segment.shape[1], -1) ## 不足16/4的用最后一个动作pad补齐
             return torch.cat((segment, pad), dim=1)
 
         start_idx = start_idx.reshape(-1).to(device=action_seq.device, dtype=torch.long)
@@ -281,6 +295,148 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             end = min(start + segment.shape[1], T)
             out[i, start:end] = segment[i, :end-start]
         return out
+
+    # =========================
+    # aggregate test time
+    # =========================
+    def _get_rollout_temporal_weights(
+        self,
+        length: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        steps = torch.arange(length, device=device, dtype=dtype)
+        beta_base = torch.full((length,), self.test_time_agg_beta, device=device, dtype=dtype)
+        weights = torch.pow(beta_base, steps)
+        weights = weights / weights.sum().clamp_min(1e-8)
+        return weights
+
+    def _compute_rollout_branch_confidence(
+        self,
+        score_A: torch.Tensor,
+        score_B: torch.Tensor,
+    ) -> torch.Tensor:
+        scores = torch.stack((score_A, score_B), dim=-1)
+        ##return F.softmax(scores / self.test_time_agg_tau, dim=-1)
+
+        # scaled_scores = (scores / self.test_time_agg_tau).clamp(min=-50.0, max=50.0)
+        # return torch.exp(scaled_scores)
+        scaled_scores = (scores / self.test_time_agg_tau).clamp(min=-20.0, max=20.0)
+        pairwise_confidence = F.softmax(scaled_scores, dim=-1)  ## 负责这轮里 A/B 谁更占优
+        query_reliability = torch.exp(torch.max(scaled_scores, dim=-1, keepdim=True).values)    ## 负责这轮整体值不值得信
+        return pairwise_confidence * query_reliability
+
+    def _ensure_rollout_agg_buffers(
+        self,
+        batch_size: int,
+        chunk_len: int,
+        action_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        shift = max(1, int(self.n_action_steps))    ## n_action_steps：4
+        rows = int(np.ceil(chunk_len / shift)) * 2  ## 走完当前预测AC（长=16），需要ceil(chunk_len / shift)个rollout    ## *2是两个branch
+        rows = max(rows, 2)
+        needs_init = (
+            self._agg_action_buffer is None
+            or self._agg_weight_buffer is None
+            or self._agg_branch_buffer is None
+            or self._agg_action_buffer.shape != (batch_size, rows, chunk_len, action_dim)
+            or self._agg_action_buffer.device != device
+            or self._agg_action_buffer.dtype != dtype
+        )
+        if needs_init:
+            self._agg_action_buffer = torch.zeros(
+                (batch_size, rows, chunk_len, action_dim),
+                device=device,
+                dtype=dtype,
+            )
+            self._agg_weight_buffer = torch.zeros(
+                (batch_size, rows, chunk_len),
+                device=device,
+                dtype=dtype,
+            )
+            self._agg_branch_buffer = torch.full(
+                (batch_size, rows),
+                fill_value=-1,
+                device=device,
+                dtype=torch.long,
+            )
+
+    def _aggregate_rollout_candidates(
+        self,
+        candidate_actions_norm: torch.Tensor,
+        score_A: torch.Tensor,
+        score_B: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Minimal D3P-style test-time aggregator:
+          - keep A/B rollout-aligned trajectories from the latest overlapping queries
+          - convert current query scores to pairwise_confidence * query_reliability
+          - multiply by temporal decay weights
+          - choose the max-weight trajectory per future step
+        """
+        if candidate_actions_norm.ndim != 4 or candidate_actions_norm.shape[1] != 2:
+            raise RuntimeError(
+                f"candidate_actions_norm must have shape (B,2,H,D), got {tuple(candidate_actions_norm.shape)}"
+            )
+
+        B, _, H, D = candidate_actions_norm.shape
+        self._ensure_rollout_agg_buffers(
+            batch_size=B,
+            chunk_len=H,
+            action_dim=D,
+            device=candidate_actions_norm.device,
+            dtype=candidate_actions_norm.dtype,
+        )
+
+        assert self._agg_action_buffer is not None
+        assert self._agg_weight_buffer is not None
+        assert self._agg_branch_buffer is not None
+
+        shift = min(max(1, int(self.n_action_steps)), H)
+        rows_to_insert = candidate_actions_norm.shape[1]    ## 2
+
+        self._agg_action_buffer = torch.roll(self._agg_action_buffer, shifts=-rows_to_insert, dims=1)
+        self._agg_weight_buffer = torch.roll(self._agg_weight_buffer, shifts=-rows_to_insert, dims=1)
+        self._agg_branch_buffer = torch.roll(self._agg_branch_buffer, shifts=-rows_to_insert, dims=1)
+
+        self._agg_action_buffer[:, :, :-shift] = self._agg_action_buffer[:, :, shift:].clone()
+        self._agg_action_buffer[:, :, -shift:] = 0
+        self._agg_weight_buffer[:, :, :-shift] = self._agg_weight_buffer[:, :, shift:].clone()
+        self._agg_weight_buffer[:, :, -shift:] = 0
+
+        temporal_weights = self._get_rollout_temporal_weights(
+            length=H,
+            device=candidate_actions_norm.device,
+            dtype=candidate_actions_norm.dtype,
+        )
+        conf = self._compute_rollout_branch_confidence(score_A, score_B)  # (B,2)
+        candidate_weights = conf.unsqueeze(-1) * temporal_weights.view(1, 1, H)
+
+        self._agg_action_buffer[:, -rows_to_insert:] = candidate_actions_norm
+        self._agg_weight_buffer[:, -rows_to_insert:] = candidate_weights
+        self._agg_branch_buffer[:, -rows_to_insert:] = torch.tensor(
+            [0, 1],
+            device=candidate_actions_norm.device,
+            dtype=torch.long,
+        ).view(1, rows_to_insert).expand(B, rows_to_insert)
+
+        best_row_idx = torch.argmax(self._agg_weight_buffer, dim=1)  # (B,H)
+        action_rows = self._agg_action_buffer.permute(0, 2, 1, 3)    # (B,H,R,D)
+        aggregated = torch.gather(
+            action_rows,
+            dim=2,
+            index=best_row_idx.unsqueeze(-1).unsqueeze(-1).expand(B, H, 1, D),
+        ).squeeze(2)
+
+        branch_rows = self._agg_branch_buffer.unsqueeze(1).expand(B, H, -1)
+        chosen_branch = torch.gather(
+            branch_rows,
+            dim=2,
+            index=best_row_idx.unsqueeze(-1),
+        ).squeeze(-1)
+        return aggregated, chosen_branch
 
     # =========================
     # DKO
@@ -876,19 +1032,6 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
 
         return actor_loss, bc_loss, q_loss
 
-    ## 把归一化动作还原成真实动作'action_pred'和'action'
-    def _format_action_from_normalized(
-        self,
-        action_norm: torch.Tensor,
-        start_idx,
-    ) -> Dict[str, torch.Tensor]:
-        action = self.normalizer.unnormalize(naction=action_norm)
-        action_run = self._extract_action_segment(action, start_idx, self.n_action_steps)
-        return {
-            'action_pred': action,  ## 完整预测AC
-            'action': action_run,   ## 真实要执行的 action 段
-        }
-
     # ===========================================================================
     # Public actor API
     # ===========================================================================
@@ -929,15 +1072,10 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
     def _compute_branch_q_score(
         self,
         common: Dict[str, Optional[torch.Tensor]],
-        action_norm: torch.Tensor,
-        branch: str,
+        aligned_action_norm: torch.Tensor,
     ) -> torch.Tensor:
-        B = action_norm.shape[0]
-        q_action = self._extract_action_segment(
-            action_norm,
-            self._get_action_start(branch),
-            self.Tr,
-        ).reshape((B, -1))
+        B = aligned_action_norm.shape[0]
+        q_action = aligned_action_norm[:, :self.Tr].reshape((B, -1))
         q1, q2 = self.critic_target(
             common['pcd'], common['state'], common['subgoal'], q_action
         )
@@ -951,8 +1089,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         common: Dict[str, Optional[torch.Tensor]],
         err_A: torch.Tensor,
         err_B: torch.Tensor,
-        action_A_norm: torch.Tensor,
-        action_B_norm: torch.Tensor,
+        aligned_A_norm: torch.Tensor,
+        aligned_B_norm: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         if self.branch_selector == 'err':
             select_B = (err_B < err_A)
@@ -960,8 +1098,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             select_score_B = -err_B
             select_source = torch.zeros_like(err_A, dtype=torch.long)   # 0 = 比较 diffusion errors
         else:
-            q_A = self._compute_branch_q_score(common, action_A_norm, branch='A')   ## AC在不同branch使用的起点不同
-            q_B = self._compute_branch_q_score(common, action_B_norm, branch=self.b_branch)
+            q_A = self._compute_branch_q_score(common, aligned_action_norm=aligned_A_norm)
+            q_B = self._compute_branch_q_score(common, aligned_action_norm=aligned_B_norm)
 
             if self.branch_selector == 'q':
                 select_B = q_B > q_A
@@ -1030,7 +1168,11 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
                     action_norm,
                     start_idx=exec_start_idx,
                 )   ## A：把 [1:1+n_action_steps] 平滑后放回 [1:...] / B: 把 [0:0+n_action_steps] 平滑后放回 [0:...]
-            out = self._format_action_from_normalized(action_norm, start_idx=exec_start_idx)  ## 'action_pred'完整预测AC，'action'真实要执行的 action 段 (B,AC长=4,dimA）
+            action = self.normalizer.unnormalize(naction=action_norm)
+            out = {
+                'action_pred': action,  ## 完整预测AC
+                'action': self._extract_action_segment(action, exec_start_idx, self.n_action_steps),
+            }   ## 'action_pred'完整预测AC，'action'真实要执行的 action 段 (B,AC长=4,dimA）
 
             if branch == 'A':
                 out['branch_err_A'] = err.unsqueeze(-1)
@@ -1062,37 +1204,66 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         with torch.no_grad():
             action_B_norm = self.conditional_sample_action(cond=cond_B_run, model=None)
         err_B = self.compute_ddpm_error(cond=cond_B_run, action_norm=action_B_norm)   ## (B,1)
+        #################### A/B 各自 start index 对齐 #####################
+        start_A = self._get_action_start('A')                 ## 1
+        start_B = self._get_action_start(self.b_branch)       ## 0
+        aligned_A_norm = self._extract_action_segment(
+            action_A_norm, start_A, self.horizon,
+        )
+        aligned_B_norm = self._extract_action_segment(
+            action_B_norm, start_B, self.horizon,
+        )
 
         selector_out = self._select_branch_in_switch(
             common=common,
             err_A=err_A,
             err_B=err_B,
-            action_A_norm=action_A_norm,
-            action_B_norm=action_B_norm,
+            aligned_A_norm=aligned_A_norm,
+            aligned_B_norm=aligned_B_norm,
         )
+
+        ## aggregate test time
+        if self.use_test_time_aggregation:
+            aggregated_norm, chosen_branch = self._aggregate_rollout_candidates(
+                candidate_actions_norm=torch.stack((aligned_A_norm, aligned_B_norm), dim=1),
+                score_A=selector_out['select_score_A'],
+                score_B=selector_out['select_score_B'],
+            )
+            out = {
+                'action': self.normalizer.unnormalize(naction=aggregated_norm[:, :self.n_action_steps]),
+                'selected_branch_exec_ratio': chosen_branch[:, :self.n_action_steps].float().mean(
+                    dim=1, keepdim=True
+                ),
+            }
+            out['branch_err_A'] = selector_out['select_score_A'].unsqueeze(-1)   ## (B,1)
+            out['branch_err_B'] = selector_out['select_score_B'].unsqueeze(-1)   ## (B,1)
+            if self.branch_selector == 'hybrid_gate':
+                out['branch_select_source'] = selector_out['select_source'].unsqueeze(-1)
+            return out
+
+        ## 直接按score选
         select_B = selector_out['select_B']
-        action_sel_norm = torch.where(select_B, action_B_norm, action_A_norm)
-        ## action_smoothing和还原成真实动作
-        selected_start_idx = self._get_selected_action_start(select_B)   ## A:1, B:0
+        action_sel_norm = torch.where(select_B, action_B_norm, action_A_norm)   ## 原始hard-select完整AC
+        action_sel_aligned_norm = torch.where(select_B, aligned_B_norm, aligned_A_norm)
+
+        ## action_smoothing
         if self.use_action_smoothing:
-            action_sel_norm = self._smooth_selected_action_sequence(
-                action_sel_norm,
-                start_idx=selected_start_idx,
-            )   ## A：把 [1:1+n_action_steps] 平滑后放回 [1:...] / B: 把 [0:0+n_action_steps] 平滑后放回 [0:...]
+            action_sel_aligned_norm = self._smooth_selected_action_sequence(
+                action_sel_aligned_norm,
+            )   ## rollout-aligned后，当前执行段总是从 index 0 开始
 
-        out = self._format_action_from_normalized(
-            action_sel_norm,
-            start_idx=selected_start_idx,
-        )  ## 'action_pred'完整预测AC，'action'真实要执行的 action 段 (B,AC长=4,dimA）
-
+        ## 还原成真实动作（unnormalize+截取n_action_steps）
+        out = {
+            'action_pred': self.normalizer.unnormalize(naction=action_sel_norm),   ## 保持原始hard-select完整AC，避免改动train诊断语义
+            'action': self.normalizer.unnormalize(
+                naction=action_sel_aligned_norm[:, :self.n_action_steps]
+            ),
+            'selected_branch': select_B[:, 0, 0].to(dtype=action_sel_norm.dtype).unsqueeze(-1),    ## (B,1) e.g.[1,0,1,1,0,0...]
+        }
         out['branch_err_A'] = selector_out['select_score_A'].unsqueeze(-1)   ## (B,1)
         out['branch_err_B'] = selector_out['select_score_B'].unsqueeze(-1)   ## (B,1)
-        out['branch_select_source'] = selector_out['select_source'].unsqueeze(-1)
-            # branch_select_source codes:
-            #   0 = err-based decision
-            #   1 = q-based decision
-            #   2 = hybrid_linear decision
-        out['selected_branch'] = select_B[:, 0, 0].to(dtype=action_sel_norm.dtype).unsqueeze(-1)    ## (B,1) e.g.[1,0,1,1,0,0...]
+        if self.branch_selector == 'hybrid_gate':
+            out['branch_select_source'] = selector_out['select_source'].unsqueeze(-1)
         return out
 
     # =========================
@@ -1104,7 +1275,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
     def _smooth_selected_action_sequence(
         self,
         action_norm: torch.Tensor,
-        start_idx,
+        start_idx=0,
     ) -> torch.Tensor:
         """
         D3P-style smoothing-only post-processing:
@@ -1140,15 +1311,16 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             return action_norm
 
         if self._smoothing_prev_exec_norm is None:  ## 当前 episode 是第一次 rollout chunk
-            ## A
             anchor_idx = (start_idx - 1).clamp(min=0).view(B, 1, 1).expand(B, 1, D) ## A：添加action_norm[:, 0] / B：添加action_norm[:, 0]
-            current_anchor = torch.gather(action_norm, dim=1, index=anchor_idx) ##按每个 batch 的 anchor_idx 从时间维度取出一个 action：action_norm[:, 0:1, :]
+            current_anchor = torch.gather(action_norm, dim=1, index=anchor_idx) ##(B, 1, D) ##按每个 batch 的 anchor_idx 从时间维度取出一个 action：action_norm[:, 0:1, :]
             aug = torch.cat((current_anchor, exec_seq), dim=1)  ## (B, 5, D)
+            ##即（action_norm[:, 0, :]拼action_norm[:, 1:5或0:4， ：]）
         else:   ## 后续 rollout chunk
             prev_last = self._smoothing_prev_exec_norm[:, -1:, :].to(
                 device=action_norm.device, dtype=action_norm.dtype
             )
             aug = torch.cat((prev_last, exec_seq), dim=1)   ## 拼上一段的最后一步
+            ##即（_smoothing_prev_exec_norm[:, -1, :]拼action_norm[:, 1:5或0:4， ：]）
 
         ##savgol_filter平滑窗口：AC越长，平滑窗口可以稍大；AC短时，用最小窗口 3。
         window = min(max(3, self.n_action_steps // 2 + 1), aug.shape[1])

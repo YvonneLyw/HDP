@@ -482,7 +482,8 @@ class TrainWorkspace(BaseWorkspace):
 
                     # run rollout
                     # ************ 在仿真环境中测试 ************
-                    if (self.epoch_actor > 0) and ((self.epoch_actor % cfg.training.rollout_every) == 0):
+                    if (self.epoch_actor % cfg.training.rollout_every) == 0:
+                    ## if (self.epoch_actor > 0) and ((self.epoch_actor % cfg.training.rollout_every) == 0):
                         runner_log = env_runner.run(self.model)
                         step_log.update(runner_log)
 
@@ -522,9 +523,12 @@ class TrainWorkspace(BaseWorkspace):
                             # 
                             ## pred_action = self.model.predict_action(batch)['action_pred']
                             pred_out = self.model.predict_action(batch)
-                            pred_action = pred_out['action_pred']
-                            mse_action = torch.nn.functional.mse_loss(pred_action, batch['action'])
-                            step_log['train_mse_error_action'] = mse_action.item()
+                            pred_action = None
+                            mse_action = None
+                            if 'action_pred' in pred_out:
+                                pred_action = pred_out['action_pred']
+                                mse_action = torch.nn.functional.mse_loss(pred_action, batch['action'])
+                                step_log['train_mse_error_action'] = mse_action.item()
                             if 'branch_err_A' in pred_out:
                                 step_log['train_branch_err_A'] = pred_out['branch_err_A'].mean().item()
                             if 'branch_err_B' in pred_out:
@@ -537,10 +541,14 @@ class TrainWorkspace(BaseWorkspace):
                                 step_log['train_branch_select_source_q_ratio'] = (
                                     (branch_select_source == 1).float().mean().item()
                                 )
-                                step_log['train_branch_select_source_hybrid_linear_ratio'] = (
-                                    (branch_select_source == 2).float().mean().item()
-                                )
-                            if 'selected_branch' in pred_out:
+                                # step_log['train_branch_select_source_hybrid_linear_ratio'] = (
+                                #     (branch_select_source == 2).float().mean().item()
+                                # )
+                            if 'selected_branch_exec_ratio' in pred_out:
+                                selected_b_ratio = pred_out['selected_branch_exec_ratio'].mean().item()
+                                step_log['train_selected_branch_exec_B_ratio'] = selected_b_ratio
+                                step_log['train_selected_branch_B_ratio'] = selected_b_ratio
+                            elif 'selected_branch' in pred_out:
                                 selected_b_ratio = pred_out['selected_branch'].mean().item()
                                 step_log['train_selected_branch_B_ratio'] = selected_b_ratio
                             

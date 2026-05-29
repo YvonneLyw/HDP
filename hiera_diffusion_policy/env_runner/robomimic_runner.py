@@ -369,7 +369,7 @@ class RobomimicRunner(BasePcdRunner):
         selected_branch_trace = list()
         branch_select_source_err_trace = list()
         branch_select_source_q_trace = list()
-        branch_select_source_hybrid_linear_trace = list()
+        # branch_select_source_hybrid_linear_trace = list()
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
@@ -492,13 +492,15 @@ class RobomimicRunner(BasePcdRunner):
                     branch_err_A_trace.append(float(np_action_dict['branch_err_A'].mean()))         ## (B,1) -> 标量 -> (循环次数,1)
                 if 'branch_err_B' in np_action_dict:
                     branch_err_B_trace.append(float(np_action_dict['branch_err_B'].mean()))         ## (B,1) -> 标量 -> (循环次数,1)
-                if 'selected_branch' in np_action_dict:
+                if 'selected_branch_exec_ratio' in np_action_dict:
+                    selected_branch_trace.append(float(np_action_dict['selected_branch_exec_ratio'].mean()))
+                elif 'selected_branch' in np_action_dict:
                     selected_branch_trace.append(float(np_action_dict['selected_branch'].mean()))   ## (B,1) -> 标量 -> (循环次数,1)
                 if 'branch_select_source' in np_action_dict:
                     branch_select_source = np_action_dict['branch_select_source']
                     branch_select_source_err_trace.append(float((branch_select_source == 0).mean()))
                     branch_select_source_q_trace.append(float((branch_select_source == 1).mean()))
-                    branch_select_source_hybrid_linear_trace.append(float((branch_select_source == 2).mean()))
+                    # branch_select_source_hybrid_linear_trace.append(float((branch_select_source == 2).mean()))
 
                 # handle latency_steps, we discard the first n_latency_steps actions
                 # to simulate latency
@@ -574,28 +576,28 @@ class RobomimicRunner(BasePcdRunner):
             log_data['branch_err_B_mean'] = float(np.mean(branch_err_B_trace))          ## (循环次数,1) -> 标量
         if len(selected_branch_trace) > 0:
             log_data['selected_branch_B_ratio'] = float(np.mean(selected_branch_trace)) ## (循环次数,1) -> 标量
-            ## rollout内各step的选B率（不平均整条traj）
-            selected_branch_table = wandb.Table(
-                data=[
-                    [int(step_idx), float(step_ratio)]
-                    for step_idx, step_ratio in enumerate(selected_branch_trace)
-                ],
-                columns=['rollout_step', 'selected_branch_B_ratio'],
-            )
-            log_data['selected_branch_B_ratio_trace'] = wandb.plot.line(
-                selected_branch_table,
-                'rollout_step',
-                'selected_branch_B_ratio',
-                title='Selected Branch B Ratio Trace',
-            )
+            # ## rollout内各step的选B率（不平均整条traj）
+            # selected_branch_table = wandb.Table(
+            #     data=[
+            #         [int(step_idx), float(step_ratio)]
+            #         for step_idx, step_ratio in enumerate(selected_branch_trace)
+            #     ],
+            #     columns=['rollout_step', 'selected_branch_B_ratio'],
+            # )
+            # log_data['selected_branch_B_ratio_trace'] = wandb.plot.line(
+            #     selected_branch_table,
+            #     'rollout_step',
+            #     'selected_branch_B_ratio',
+            #     title='Selected Branch B Ratio Trace',
+            # )
         if len(branch_select_source_err_trace) > 0:
             log_data['branch_select_source_err_ratio'] = float(np.mean(branch_select_source_err_trace))
         if len(branch_select_source_q_trace) > 0:
             log_data['branch_select_source_q_ratio'] = float(np.mean(branch_select_source_q_trace))
-        if len(branch_select_source_hybrid_linear_trace) > 0:
-            log_data['branch_select_source_hybrid_linear_ratio'] = float(
-                np.mean(branch_select_source_hybrid_linear_trace)
-            )
+        # if len(branch_select_source_hybrid_linear_trace) > 0:
+        #     log_data['branch_select_source_hybrid_linear_ratio'] = float(
+        #         np.mean(branch_select_source_hybrid_linear_trace)
+        #     )
 
         return log_data
     

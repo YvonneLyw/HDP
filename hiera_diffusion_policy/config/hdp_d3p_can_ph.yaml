@@ -159,11 +159,14 @@ policy:
   #########################新增############一直到
   mode: SINGLE            # SINGLE / SWITCH
   single_branch: A        # A / B1 / B2 (mode=SINGLE 时训练和rollout都用这个分支)
-  b_branch: B1            # B1 / B2 (mode=SWITCH 时与A做训练切换和rollout选择)
+  b_branch: B2            # B1 / B2 (mode=SWITCH 时与A做训练切换和rollout选择)
   switch_prob_b: 0.5      # mode=SWITCH 时训练阶段采样 B 分支概率
-  b_branch_use_q_loss: true   # 是否让B分支也参与Q-loss
-  branch_selector: hybrid_gate    # err / q / hybrid_gate / hybrid_linear
-  use_action_smoothing: true
+  b_branch_use_q_loss: false   # 是否让B分支也参与Q-loss
+  branch_selector: err    # err / q / hybrid_gate / hybrid_linear
+  use_action_smoothing: false
+  use_test_time_aggregation: true
+  test_time_agg_beta: 0.97
+  test_time_agg_tau: 0.1
   d3p_rollout_error_samples: 10
   use_koopman_aux: true  # B分支是否叠加DKO辅助loss（koop_consis_kvp / koop_consis_fea）
   extra_cond_dim: ${extra_cond_dim}  
