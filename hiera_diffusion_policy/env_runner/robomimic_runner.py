@@ -364,8 +364,8 @@ class RobomimicRunner(BasePcdRunner):
         # allocate data     ##分配结果存储空间
         all_video_paths = [None] * n_inits
         all_rewards = [None] * n_inits
-        branch_err_A_trace = list()
-        branch_err_B_trace = list()
+        branch_score_A_trace = list()
+        branch_score_B_trace = list()
         selected_branch_trace = list()
         branch_select_source_err_trace = list()
         branch_select_source_q_trace = list()
@@ -488,12 +488,13 @@ class RobomimicRunner(BasePcdRunner):
                 np_action_dict = dict_apply(action_dict,
                     lambda x: x.detach().to('cpu').numpy())
                 ## 从 policy 输出：err等 取诊断字段做日志聚合（平均28个env)########################
-                if 'branch_err_A' in np_action_dict:
-                    branch_err_A_trace.append(float(np_action_dict['branch_err_A'].mean()))         ## (B,1) -> 标量 -> (循环次数,1)
-                if 'branch_err_B' in np_action_dict:
-                    branch_err_B_trace.append(float(np_action_dict['branch_err_B'].mean()))         ## (B,1) -> 标量 -> (循环次数,1)
+                if 'branch_score_A' in np_action_dict:
+                    branch_score_A_trace.append(float(np_action_dict['branch_score_A'].mean()))         ## (B,1) -> 标量 -> (循环次数,1)
+                if 'branch_score_B' in np_action_dict:
+                    branch_score_B_trace.append(float(np_action_dict['branch_score_B'].mean()))         ## (B,1) -> 标量 -> (循环次数,1)
+
                 if 'selected_branch_exec_ratio' in np_action_dict:
-                    selected_branch_trace.append(float(np_action_dict['selected_branch_exec_ratio'].mean()))
+                    selected_branch_trace.append(float(np_action_dict['selected_branch_exec_ratio'].mean()))## (B,1) -> 标量 -> (循环次数,1)
                 elif 'selected_branch' in np_action_dict:
                     selected_branch_trace.append(float(np_action_dict['selected_branch'].mean()))   ## (B,1) -> 标量 -> (循环次数,1)
                 if 'branch_select_source' in np_action_dict:
@@ -570,26 +571,26 @@ class RobomimicRunner(BasePcdRunner):
             log_data[name] = value
 
         ###### 记录此次rollout（平均整条traj）的policy两分支输出########################
-        if len(branch_err_A_trace) > 0:
-            log_data['branch_err_A_mean'] = float(np.mean(branch_err_A_trace))          ## (循环次数,1) -> 标量
-        if len(branch_err_B_trace) > 0:
-            log_data['branch_err_B_mean'] = float(np.mean(branch_err_B_trace))          ## (循环次数,1) -> 标量
+        if len(branch_score_A_trace) > 0:
+            log_data['branch_score_A_mean'] = float(np.mean(branch_score_A_trace))          ## (循环次数,1) -> 标量
+        if len(branch_score_B_trace) > 0:
+            log_data['branch_score_B_mean'] = float(np.mean(branch_score_B_trace))          ## (循环次数,1) -> 标量
         if len(selected_branch_trace) > 0:
             log_data['selected_branch_B_ratio'] = float(np.mean(selected_branch_trace)) ## (循环次数,1) -> 标量
-            # ## rollout内各step的选B率（不平均整条traj）
-            # selected_branch_table = wandb.Table(
-            #     data=[
-            #         [int(step_idx), float(step_ratio)]
-            #         for step_idx, step_ratio in enumerate(selected_branch_trace)
-            #     ],
-            #     columns=['rollout_step', 'selected_branch_B_ratio'],
-            # )
-            # log_data['selected_branch_B_ratio_trace'] = wandb.plot.line(
-            #     selected_branch_table,
-            #     'rollout_step',
-            #     'selected_branch_B_ratio',
-            #     title='Selected Branch B Ratio Trace',
-            # )
+            # rollout内各step的选B率（不平均整条traj）
+            selected_branch_table = wandb.Table(
+                data=[
+                    [int(step_idx), float(step_ratio)]
+                    for step_idx, step_ratio in enumerate(selected_branch_trace)
+                ],
+                columns=['rollout_step', 'selected_branch_B_ratio'],
+            )
+            log_data['selected_branch_B_ratio_trace'] = wandb.plot.line(
+                selected_branch_table,
+                'rollout_step',
+                'selected_branch_B_ratio',
+                title='Selected Branch B Ratio Trace',
+            )
         if len(branch_select_source_err_trace) > 0:
             log_data['branch_select_source_err_ratio'] = float(np.mean(branch_select_source_err_trace))
         if len(branch_select_source_q_trace) > 0:

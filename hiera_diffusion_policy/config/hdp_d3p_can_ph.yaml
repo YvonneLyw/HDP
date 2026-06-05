@@ -157,7 +157,7 @@ policy:
   fusion_debug_checks: true
   d3p_query_every: ${task.dataset.d3p_query_every}
   #########################新增############一直到
-  mode: SINGLE            # SINGLE / SWITCH
+  mode: SWITCH             # SINGLE / SWITCH
   single_branch: A        # A / B1 / B2 (mode=SINGLE 时训练和rollout都用这个分支)
   b_branch: B2            # B1 / B2 (mode=SWITCH 时与A做训练切换和rollout选择)
   switch_prob_b: 0.5      # mode=SWITCH 时训练阶段采样 B 分支概率

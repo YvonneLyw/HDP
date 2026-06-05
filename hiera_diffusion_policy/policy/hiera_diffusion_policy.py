@@ -127,7 +127,7 @@ class HieraDiffusionPolicy(BasePcdPolicy):
         next_state = nbatch['next_state'].reshape((B, -1))
         next_subgoal = nbatch['next_subgoal'] # (B, 8)
         next_action = nbatch['next_action'][:, self.observation_history_num-1:
-                                            self.observation_history_num-1+self.Tr] # (B, A)
+                                            self.observation_history_num-1+self.Tr] # (B, A)    ##(B,Tr,dim_a)
         next_action = next_action.reshape((B, -1))
         with torch.no_grad():
             current_q1, current_q2 = self.critic_target(
@@ -151,8 +151,7 @@ class HieraDiffusionPolicy(BasePcdPolicy):
         with torch.no_grad():
             for t in self.noise_scheduler_guider.timesteps:
                 # predict subgoal noise
-                pred = self.guider_target(
-                    pcd, state, sg, t)
+                pred = self.guider_target(pcd, state, sg, t)
                 # compute previous subgoal
                 sg = self.noise_scheduler_guider.step(
                     pred, t, sg, generator=None).prev_sample
@@ -303,7 +302,7 @@ class HieraDiffusionPolicy(BasePcdPolicy):
         dones = torch.zeros((B, 1), device=self.device)
         dones[reward==10] = 1
 
-        # action随机加平移噪声，旋转噪声设为0
+        # 50%概率给action随机加平移噪声和旋转噪声
         # 噪声逻辑：先生成原始尺度噪声，再乘scale
         # 小噪声：最终action不加噪声, done不变
         # 大噪声: r=0, done=1

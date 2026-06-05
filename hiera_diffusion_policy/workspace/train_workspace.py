@@ -517,8 +517,8 @@ class TrainWorkspace(BaseWorkspace):
                             # pred_out: = {
                             #     "action_pred": action,          # full predicted action sequence
                             #     "action": action_run,           # action segment to execute
-                            #     "branch_err_A": branch_err_A,   # branch A reconstruction / DDPM error
-                            #     "branch_err_B": branch_err_B,   # branch B reconstruction / DDPM error
+                            #     "branch_score_A": branch_score_A,   # branch A selector score
+                            #     "branch_score_B": branch_score_B,   # branch B selector score
                             #     "selected_branch": selected_branch,
                             # 
                             ## pred_action = self.model.predict_action(batch)['action_pred']
@@ -527,26 +527,22 @@ class TrainWorkspace(BaseWorkspace):
                             mse_action = None
                             if 'action_pred' in pred_out:
                                 pred_action = pred_out['action_pred']
-                                mse_action = torch.nn.functional.mse_loss(pred_action, batch['action'])
+                                mse_action = torch.nn.functional.mse_loss(pred_action, batch['action']) ##标量
                                 step_log['train_mse_error_action'] = mse_action.item()
-                            if 'branch_err_A' in pred_out:
-                                step_log['train_branch_err_A'] = pred_out['branch_err_A'].mean().item()
-                            if 'branch_err_B' in pred_out:
-                                step_log['train_branch_err_B'] = pred_out['branch_err_B'].mean().item()
+                            if 'branch_score_A' in pred_out:
+                                step_log['train_branch_score_A'] = pred_out['branch_score_A'].mean().item()
+                            if 'branch_score_B' in pred_out:
+                                step_log['train_branch_score_B'] = pred_out['branch_score_B'].mean().item()
                             if 'branch_select_source' in pred_out:
                                 branch_select_source = pred_out['branch_select_source']
-                                step_log['train_branch_select_source_err_ratio'] = (
-                                    (branch_select_source == 0).float().mean().item()
-                                )
-                                step_log['train_branch_select_source_q_ratio'] = (
-                                    (branch_select_source == 1).float().mean().item()
-                                )
+                                step_log['train_branch_select_source_err_ratio'] = ((branch_select_source == 0).float().mean().item())
+                                step_log['train_branch_select_source_q_ratio'] = ((branch_select_source == 1).float().mean().item())
                                 # step_log['train_branch_select_source_hybrid_linear_ratio'] = (
                                 #     (branch_select_source == 2).float().mean().item()
                                 # )
                             if 'selected_branch_exec_ratio' in pred_out:
                                 selected_b_ratio = pred_out['selected_branch_exec_ratio'].mean().item()
-                                step_log['train_selected_branch_exec_B_ratio'] = selected_b_ratio
+                                # step_log['train_selected_branch_exec_B_ratio'] = selected_b_ratio
                                 step_log['train_selected_branch_B_ratio'] = selected_b_ratio
                             elif 'selected_branch' in pred_out:
                                 selected_b_ratio = pred_out['selected_branch'].mean().item()

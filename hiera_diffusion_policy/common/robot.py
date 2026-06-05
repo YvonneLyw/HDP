@@ -701,9 +701,9 @@ def get_subgoals_stage_robomimic(
         reward.append(r)
 
     return {
-        'subgoal': np.array(fin_sgs),
-        'next_subgoal': np.array(next_fin_sgs),
-        'reward': np.array(reward)
+        'subgoal': np.array(fin_sgs),           ## (N - Tr, 8)
+        'next_subgoal': np.array(next_fin_sgs), ## (N - Tr, 8)
+        'reward': np.array(reward)              ## (N - Tr,)
     }
 
 

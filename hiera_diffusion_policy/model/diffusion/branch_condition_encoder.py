@@ -103,8 +103,8 @@ class AttentionFusion(nn.Module):
     def forward(self, fea_act: torch.Tensor, fea_vis: torch.Tensor) -> torch.Tensor:
         bs = fea_act.shape[0]
         act_flat = fea_act.view(bs, -1)
-        f1 = self.fc_act(act_flat)   # [batch_size, out_dim]
-        f2 = self.fc_vis(fea_vis)    # [batch_size, out_dim]
+        f1 = self.fc_act(act_flat)   # [B, out_dim]
+        f2 = self.fc_vis(fea_vis)    # [B, out_dim]
         features = torch.stack((f1, f2), dim=1)        # (B, 2, out_dim)
         scores = self.attention_weight(features).squeeze(-1)   # (B, 2)
         weights = torch.softmax(scores, dim=1)         # (B, 2)

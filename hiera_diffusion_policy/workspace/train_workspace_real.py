@@ -468,13 +468,21 @@ class TrainWorkspace(BaseWorkspace):
                         with torch.no_grad():
                             batch = train_sampling_batch    # Tensor, no norm
 
-                            pred_action = self.model.predict_action(batch)['action_pred']
-                            mse_action = torch.nn.functional.mse_loss(pred_action, batch['action'])
-                            step_log['train_mse_error_action'] = mse_action.item()
+                            # pred_action = self.model.predict_action(batch)['action_pred']
+                            # mse_action = torch.nn.functional.mse_loss(pred_action, batch['action'])
+                            # step_log['train_mse_error_action'] = mse_action.item()
+                            pred_out = self.model.predict_action(batch)
+                            pred_action = pred_out.get('action_pred')
+                            mse_action = None
+                            # Test-time aggregation returns only the executable action chunk.
+                            if pred_action is not None:
+                                mse_action = torch.nn.functional.mse_loss(pred_action, batch['action'])
+                                step_log['train_mse_error_action'] = mse_action.item()
                             
                             # release RAM
                             del batch
-                            del pred_action, mse_action
+                            #del pred_action, mse_action
+                            del pred_out, pred_action, mse_action
                     
                     # ************ checkpoint ************
                     if (self.epoch_actor % cfg.training.checkpoint_every) == 0:
