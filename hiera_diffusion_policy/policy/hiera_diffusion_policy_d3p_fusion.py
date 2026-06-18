@@ -10,6 +10,7 @@ except ImportError:
 
 from hiera_diffusion_policy.model.diffusion.branch_condition_encoder import BranchConditionEncoder
 from hiera_diffusion_policy.model.diffusion.d3p_koopman import DeepKoopmanModule
+from hiera_diffusion_policy.policy.doser_branch_selector import DoserBranchSelector
 from hiera_diffusion_policy.policy.hiera_diffusion_policy import HieraDiffusionPolicy
 
 try:
@@ -63,6 +64,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         image_feat_dim: int = 64,
         qpos_feat_dim: int = 9,
         image_size=(84, 84),
+        doser_selector: Optional[Dict] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -101,9 +103,9 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             raise ValueError(f"d3p_query_every is fixed to 4 in current fusion stage, got {self.d3p_query_every}")
         if self.d3p_rollout_error_samples < 1:
             raise ValueError(f"d3p_rollout_error_samples must be >= 1, got {self.d3p_rollout_error_samples}")
-        if self.branch_selector not in ('err', 'q', 'hybrid_gate', 'hybrid_linear'):
+        if self.branch_selector not in ('err', 'q', 'hybrid_gate', 'hybrid_linear', 'doser'):
             raise ValueError(
-                "branch_selector must be one of ['err','q','hybrid_gate','hybrid_linear'], "
+                "branch_selector must be one of ['err','q','hybrid_gate','hybrid_linear','doser'], "
                 f"got {self.branch_selector}"
             )
         if self.test_time_agg_beta <= 0.0:
@@ -161,6 +163,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             )
         else:
             self.dko = None
+        doser_selector_cfg = dict(doser_selector or {})
+        self.doser_selector = DoserBranchSelector(**doser_selector_cfg)
         self._smoothing_prev_exec_norm: Optional[torch.Tensor] = None   ## 上一次最终执行的动作序列，用于判断这是不是当前 episode 的第一次动作聚合（没有历史执行动作，所以逻辑会特殊处理）
         self._agg_action_buffer: Optional[torch.Tensor] = None
         self._agg_weight_buffer: Optional[torch.Tensor] = None
@@ -580,8 +584,12 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             subgoal = torch.zeros((B, self.subgoal_dim), dtype=state.dtype, device=state.device)    ##这个原版是None
         subgoal_zero = torch.zeros_like(subgoal)
 
-        # Pair-style D3P subgoal pair. Prefer explicit (t, t+h) pair from dataset.
+        # Branch-B / DOSER side channels are intentionally kept outside the HDP
+        # Normalizer: images are float [0,1] and normalized inside the image
+        # encoder; qpos is standardized by dataset/runner; action/subgoal below
+        # are explicitly mapped through the HDP action/state normalizer.
         image_pair = raw_batch['image'] if 'image' in raw_batch else None
+        doser_image_pair = raw_batch['doser_image_pair'] if 'doser_image_pair' in raw_batch else None
         qpos_pair = raw_batch['qpos'] if 'qpos' in raw_batch else None  ## (B, 2时间, 9=7jiont+2爪宽)
         
         if 'd3p_subgoal_pair' in raw_batch:
@@ -655,6 +663,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             'fea_fuse_pair': fea_fuse_pair,
             'b1_latent_act_pair': None,
             'image_pair': image_pair,
+            'doser_image_pair': doser_image_pair,
+            'qpos_pair': qpos_pair,
 
             'd3p_action_pair': d3p_action_pair,
             'act_is_pad_pair': act_is_pad_pair,
@@ -1118,27 +1128,42 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
 
         with torch.no_grad():
             action_A_norm = self.conditional_sample_action(cond=cond_A_run, model=None)
-        err_A = self.compute_ddpm_error(cond=cond_A_run, action_norm=action_A_norm)   ## (B,1)
 
         ########################B分支############################
         cond_B = self._build_cond_by_branch(self.b_branch, common)
         cond_B_run = self._rollout_cond_from_branch_cond(cond_B)
         with torch.no_grad():
             action_B_norm = self.conditional_sample_action(cond=cond_B_run, model=None)
-        err_B = self.compute_ddpm_error(cond=cond_B_run, action_norm=action_B_norm)   ## (B,1)
         #################### A/B 各自 start index 对齐 #####################
         start_A = self._get_action_start('A')                 ## 1
         start_B = self._get_action_start(self.b_branch)       ## 0
         aligned_A_norm = self._extract_action_segment(action_A_norm, start_A, self.horizon,)
         aligned_B_norm = self._extract_action_segment(action_B_norm, start_B, self.horizon,)
 
-        selector_out = self._select_branch_in_switch(
-            common=common,
-            err_A=err_A,
-            err_B=err_B,
-            aligned_A_norm=aligned_A_norm,
-            aligned_B_norm=aligned_B_norm,
-        )
+        if self.branch_selector == 'doser':
+            selector_out = self.doser_selector.select(
+                common=common,
+                aligned_A_norm=aligned_A_norm,
+                aligned_B_norm=aligned_B_norm,
+                critic_target=self.critic_target,
+                Tr=self.Tr,
+            )
+        else:
+            err_A = self.compute_ddpm_error(cond=cond_A_run, action_norm=action_A_norm)   ## (B,1)
+            err_B = self.compute_ddpm_error(cond=cond_B_run, action_norm=action_B_norm)   ## (B,1)
+            selector_out = self._select_branch_in_switch(
+                common=common,
+                err_A=err_A,
+                err_B=err_B,
+                aligned_A_norm=aligned_A_norm,
+                aligned_B_norm=aligned_B_norm,
+            )
+            # return {
+            #     'select_B': select_B.view(-1, 1, 1),
+            #     'select_score_A': select_score_A,
+            #     'select_score_B': select_score_B,
+            #     'select_source': select_source,
+            # }
 
         ## aggregate test time
         if self.use_test_time_aggregation:
@@ -1155,8 +1180,16 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             }
             out['branch_score_A'] = selector_out['select_score_A'].unsqueeze(-1)   ## (B,1)
             out['branch_score_B'] = selector_out['select_score_B'].unsqueeze(-1)   ## (B,1)
-            if self.branch_selector == 'hybrid_gate':
+            if 'select_source' in selector_out:
                 out['branch_select_source'] = selector_out['select_source'].unsqueeze(-1)
+                # 0 = 比较 diffusion errors
+                # 1 = 比较 critic Q scores
+                # 2 = doser比较
+            if self.branch_selector == 'doser':
+                for key, value in selector_out.items():
+                    if key in ('select_B', 'select_score_A', 'select_score_B', 'select_source'):
+                        continue
+                    out[f'doser_{key}'] = value.unsqueeze(-1) if value.ndim == 1 else value
             return out
 
         ## 直接按score选
@@ -1180,8 +1213,13 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         }
         out['branch_score_A'] = selector_out['select_score_A'].unsqueeze(-1)   ## (B,1)
         out['branch_score_B'] = selector_out['select_score_B'].unsqueeze(-1)   ## (B,1)
-        if self.branch_selector == 'hybrid_gate':
+        if 'select_source' in selector_out:
             out['branch_select_source'] = selector_out['select_source'].unsqueeze(-1)
+        if self.branch_selector == 'doser':
+            for key, value in selector_out.items():
+                if key in ('select_B', 'select_score_A', 'select_score_B', 'select_source'):
+                    continue
+                out[f'doser_{key}'] = value.unsqueeze(-1) if value.ndim == 1 else value
         return out
 
     # =========================
@@ -1258,6 +1296,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         aligned_A_norm: torch.Tensor,
         aligned_B_norm: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
+        if self.branch_selector == 'doser':
+            raise RuntimeError("branch_selector='doser' should call DoserBranchSelector.select().")
         if self.branch_selector == 'err':
             select_B = (err_B < err_A)
             select_score_A = -err_A

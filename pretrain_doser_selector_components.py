@@ -214,7 +214,7 @@ def _prepare_selector_batch(model, batch: Dict[str, torch.Tensor]):
         nbatch = common["nbatch"]
         next_state = nbatch["next_state"].reshape(nbatch["next_state"].shape[0], -1)
         next_subgoal = nbatch.get("next_subgoal", None)
-        next_image = common.get("doser_image_pair", None)
+        next_image = common.get("doser_image_pair", batch.get("doser_image_pair", None))
         if next_image is not None:
             next_image = next_image[:, 1]
     return common, action_eval, next_state, next_subgoal, next_image
