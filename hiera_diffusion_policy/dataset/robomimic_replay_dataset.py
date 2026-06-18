@@ -242,16 +242,23 @@ class RobomimicReplayDataset(BasePcdDataset):
         # HDP current-t anchor keeps existing semantics with observation history.
         current_seq_idx = max(0, min(self.observation_history_num - 1, seq_len - 1)) ## 窗口内部的0是哪个内部idx）
         target_seq_idx = min(current_seq_idx + self.d3p_query_every, seq_len - 1)    ## +h
+        doser_target_seq_idx = min(current_seq_idx + self.Tr, seq_len - 1)
 
         ## 图像处理：归一化/255 -> float32 -> CHW
         front_curr = _hwc_uint8_to_chw_float01(seq['front_image'][current_seq_idx], self.image_size)
         wrist_curr = _hwc_uint8_to_chw_float01(seq['wrist_image'][current_seq_idx], self.image_size)
         front_next = _hwc_uint8_to_chw_float01(seq['front_image'][target_seq_idx], self.image_size)
         wrist_next = _hwc_uint8_to_chw_float01(seq['wrist_image'][target_seq_idx], self.image_size)
+        front_doser_next = _hwc_uint8_to_chw_float01(seq['front_image'][doser_target_seq_idx], self.image_size)
+        wrist_doser_next = _hwc_uint8_to_chw_float01(seq['wrist_image'][doser_target_seq_idx], self.image_size)
 
         image = np.stack([
             np.stack([front_curr, wrist_curr], axis=0),
             np.stack([front_next, wrist_next], axis=0),
+        ], axis=0).astype(np.float32)
+        doser_image_pair = np.stack([
+            np.stack([front_curr, wrist_curr], axis=0),
+            np.stack([front_doser_next, wrist_doser_next], axis=0),
         ], axis=0).astype(np.float32)
 
         qpos = np.stack([
@@ -292,6 +299,7 @@ class RobomimicReplayDataset(BasePcdDataset):
 
         payload = {
             'image': image,                     # (2, 2, C, H, W)
+            'doser_image_pair': doser_image_pair, # (2, 2, C, H, W), aligned to t and t+Tr
             'qpos': qpos,                       # (2, 9)
             'd3p_action_pair': d3p_action_pair, # (2, L, 10)
             'act_is_pad_pair': act_is_pad_pair, # (2, L)
