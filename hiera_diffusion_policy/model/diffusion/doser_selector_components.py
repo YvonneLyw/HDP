@@ -93,6 +93,7 @@ class LatentValueNet(nn.Module):
         return (weight * diff.pow(2)).mean()
 
 
+# 把 reconstruction error 转成 percentile rank” 的功能
 class EmpiricalPercentileMixin:
     def _init_reference_errors(self) -> None:
         self.register_buffer("reference_errors", torch.empty(0))
@@ -100,6 +101,7 @@ class EmpiricalPercentileMixin:
     def has_reference_errors(self) -> bool:
         return self.reference_errors.numel() > 0
 
+    # 把离线校准得到的一堆 error 拉平、排序、存到 detector 自己的 buffer 里。
     @torch.no_grad()
     def set_reference_errors(self, errors: torch.Tensor) -> None:
         ref = torch.as_tensor(errors, dtype=torch.float32).reshape(-1)
@@ -193,6 +195,7 @@ class FullStateActionDetector(nn.Module, EmpiricalPercentileMixin):
         self.min_sigma = float(min_sigma)
         self.max_sigma = float(max_sigma)
         self.score_samples = int(score_samples)
+
         self.image_encoder = (
             CurrentImageEncoder(self.image_shape, self.image_feat_dim)
             if self.image_shape is not None and self.image_feat_dim > 0
@@ -225,7 +228,9 @@ class FullStateActionDetector(nn.Module, EmpiricalPercentileMixin):
             parts.append(qpos.reshape(B, -1).to(device=like.device, dtype=like.dtype))
 
         if self.image_encoder is not None:
-            images = common.get("image_pair", common.get("doser_image_pair", None))
+            images = common.get("image_pair", None)
+            if images is None:
+                images = common.get("doser_image_pair", None)
             if images is None:
                 raise RuntimeError(
                     "FullStateActionDetector was trained with images, but common['image_pair'] "
@@ -357,7 +362,9 @@ class LatentDynamicsModel(nn.Module):
         if common is not None:
             state = common["state"]
             subgoal = common.get("subgoal", None)
-            image = common.get("doser_image_pair", common.get("image_pair", None))
+            image = common.get("doser_image_pair", None)
+            if image is None:
+                image = common.get("image_pair", None)
         if state is None:
             raise RuntimeError("LatentDynamicsModel.encode requires state or common.")
         return self.encoder(self._obs_feature(state, subgoal, image))

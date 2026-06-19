@@ -134,7 +134,10 @@ def _load_model_prefixes(
     source = _choose_state_dict(payload, prefer_ema=prefer_ema)
     target = model.state_dict()
     matched = {}
-    matched_prefix = {prefix: False for prefix in prefixes}
+    target_prefixed_keys = [
+        key for key in target
+        if any(key.startswith(prefix) for prefix in prefixes)
+    ]
 
     for key, value in source.items():
         if not any(key.startswith(prefix) for prefix in prefixes):
@@ -142,14 +145,14 @@ def _load_model_prefixes(
         if key not in target or target[key].shape != value.shape:
             continue
         matched[key] = value
-        for prefix in prefixes:
-            if key.startswith(prefix):
-                matched_prefix[prefix] = True
 
     if not matched:
         raise RuntimeError(f"No matching parameters loaded from {ckpt_path} for prefixes={prefixes}.")
 
-    missing_required = [prefix for prefix in required_prefixes if not matched_prefix.get(prefix, False)]
+    missing_required = [
+        prefix for prefix in required_prefixes
+        if not any(key.startswith(prefix) for key in matched)
+    ]
     if missing_required:
         raise RuntimeError(
             f"Checkpoint {ckpt_path} is missing required prefixes: {missing_required}."
@@ -157,7 +160,12 @@ def _load_model_prefixes(
 
     target.update(matched)
     model.load_state_dict(target, strict=False)
-    return matched_prefix
+    complete_prefix = {}
+    for prefix in prefixes:
+        target_keys = [key for key in target_prefixed_keys if key.startswith(prefix)]
+        loaded_keys = [key for key in target_keys if key in matched]
+        complete_prefix[prefix] = len(target_keys) > 0 and len(loaded_keys) == len(target_keys)
+    return complete_prefix
 
 
 # 实例化完整 Policy（Guider、Actor 和 Critic）为了复用接口方法（没用Guider、Actor模型本身） 和 DataLoader
@@ -193,7 +201,7 @@ def _instantiate_policy_and_data(cfg: OmegaConf, pre_cfg: OmegaConf, device: tor
     model.requires_grad_(False)
     # 创建训练 DataLoader：取一个 batch 推断网络输入维度，训练模型参数
     train_loader = DataLoader(dataset, **OmegaConf.to_container(cfg.dataloader, resolve=True))
-    # 训练完成后统计 reference errors
+    # calib_loader（不打乱）：训练完成后统计 reference errors
     if "dataloader_noshuff" in cfg:
         calib_loader = DataLoader(dataset, **OmegaConf.to_container(cfg.dataloader_noshuff, resolve=True))
     else:
@@ -214,7 +222,9 @@ def _prepare_selector_batch(model, batch: Dict[str, torch.Tensor]):
         nbatch = common["nbatch"]
         next_state = nbatch["next_state"].reshape(nbatch["next_state"].shape[0], -1)
         next_subgoal = nbatch.get("next_subgoal", None)
-        next_image = common.get("doser_image_pair", batch.get("doser_image_pair", None))
+        next_image = common.get("doser_image_pair", None)
+        if next_image is None:
+            next_image = batch.get("doser_image_pair", None)
         if next_image is not None:
             next_image = next_image[:, 1]
     return common, action_eval, next_state, next_subgoal, next_image
@@ -224,7 +234,9 @@ def _infer_dims(model, train_loader, device: torch.device) -> Dict[str, int]:
     batch = next(iter(train_loader))
     batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
     common, action_eval, _, _, _ = _prepare_selector_batch(model, batch)
-    image = common.get("image_pair", common.get("doser_image_pair", None))
+    image = common.get("image_pair", None)
+    if image is None:
+        image = common.get("doser_image_pair", None)
     return {
         "state_dim": int(common["state"].shape[-1]),
         "subgoal_dim": int(common["subgoal"].shape[-1]) if common.get("subgoal", None) is not None else 0,
@@ -281,6 +293,7 @@ def _train_components(
     device: torch.device,
 ) -> None:
     action_detector, dynamics_model, state_detector, value_net = components
+    # 一个 optimizer 管理全部参数
     params = []
     for module in components:
         params.extend(module.parameters())
@@ -298,28 +311,37 @@ def _train_components(
                 break
 
             batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+            # 准备训练数据
             common, action_eval, next_state, next_subgoal, next_image = _prepare_selector_batch(model, batch)
-            if dynamics_model.image_encoder is not None and next_image is None:
-                raise RuntimeError("LatentDynamicsModel uses images, but Tr-aligned next image is missing.")
+            # if dynamics_model.image_encoder is not None and next_image is None:
+            #     raise RuntimeError("LatentDynamicsModel uses images, but Tr-aligned next image is missing.")
 
+            # action_loss
+            action_loss = action_detector.denoising_loss(common, action_eval)
+
+            # 构造当前和下一状态 latent
             z_current = dynamics_model.encode(common=common)
             z_next = dynamics_model.encode(state=next_state, subgoal=next_subgoal, image=next_image)
+            # dynamics_loss & dynamics_recon_loss
             pred_next = dynamics_model(common, action_eval)["next_latent"]
-
-            action_loss = action_detector.denoising_loss(common, action_eval)
             dynamics_loss = F.mse_loss(pred_next, z_next.detach())
             dynamics_recon_loss = 0.5 * (
                 dynamics_model.reconstruction_loss(
                     common["state"],
                     common.get("subgoal", None),
-                    common.get("doser_image_pair", common.get("image_pair", None)),
+                    common.get("doser_image_pair", None)
+                    if common.get("doser_image_pair", None) is not None
+                    else common.get("image_pair", None),
                 )
                 + dynamics_model.reconstruction_loss(next_state, next_subgoal, next_image)
             )
+
+            # state_loss
             state_loss = state_detector.denoising_loss(
                 torch.cat((z_current.detach(), z_next.detach()), dim=0)
             )
 
+            # value_loss
             with torch.no_grad():
                 q1, q2 = model.critic_target(
                     common["pcd"],
@@ -349,6 +371,9 @@ def _train_components(
                 loss=f"{losses[-1]:.4f}",
                 action=f"{float(action_loss.detach().item()):.4f}",
                 dyn=f"{float(dynamics_loss.detach().item()):.4f}",
+                # 进度条补充 dynamics_recon_loss 和 state_loss。
+                recon=f"{float(dynamics_recon_loss.detach().item()):.4f}",
+                state=f"{float(state_loss.detach().item()):.4f}",
                 value=f"{float(value_loss.detach().item()):.4f}",
             )
             global_step += 1
@@ -370,8 +395,10 @@ def _calibrate_components(model, calib_loader, components, pre_cfg: OmegaConf, d
         if dynamics_model.image_encoder is not None and next_image is None:
             raise RuntimeError("LatentDynamicsModel uses images, but Tr-aligned next image is missing.")
 
+        # 整个校准数据上的 action reference error 分布
         action_errors.append(action_detector.reconstruction_error(common, action_eval, pre_cfg.score_samples).detach().cpu())
 
+        # 整个校准数据上的 state_latents reference error 分布
         z_current = dynamics_model.encode(common=common)
         z_next = dynamics_model.encode(state=next_state, subgoal=next_subgoal, image=next_image)
         state_latents = torch.cat((z_current, z_next), dim=0)
@@ -379,7 +406,7 @@ def _calibrate_components(model, calib_loader, components, pre_cfg: OmegaConf, d
 
     action_errors = torch.cat(action_errors, dim=0)
     state_errors = torch.cat(state_errors, dim=0)
-    # action/state_errors保存到 detector 中
+    # action/state_errorserror 拉平、排序、存到 detector 自己的 buffer 里。
     action_detector.set_reference_errors(action_errors) 
     state_detector.set_reference_errors(state_errors)
     return action_errors, state_errors
@@ -393,13 +420,15 @@ def _save_components(
     reference_errors,
 ) -> pathlib.Path:
     action_detector, dynamics_model, state_detector, value_net = components
-    action_errors, state_errors = reference_errors
+    action_errors, state_errors = reference_errors  # 未排序
+    # 创建输出目录
     output_dir = pathlib.Path(str(pre_cfg.output_dir))
     output_dir.mkdir(parents=True, exist_ok=True)
     demo_count = _resolve_pretrain_demo_count(cfg, pre_cfg)
     checkpoint_name = _checkpoint_name_with_demo_count(pre_cfg.checkpoint_name, demo_count)
     output_path = output_dir.joinpath(checkpoint_name)
 
+    # 网络结构
     metadata = {
         **dims,
         "latent_dim": int(pre_cfg.latent_dim),
@@ -419,6 +448,7 @@ def _save_components(
         else None
     )
 
+    # 所有网络参数移到 CPU，这样 checkpoint 不会绑定当前 GPU
     def cpu_state_dict(module):
         return {
             key: value.detach().cpu() if torch.is_tensor(value) else value
@@ -435,6 +465,7 @@ def _save_components(
             "state_detector": cpu_state_dict(state_detector),
             "value_net": cpu_state_dict(value_net),
         },
+        # 未排序
         "reference_errors": {
             "action": action_errors,
             "state": state_errors,

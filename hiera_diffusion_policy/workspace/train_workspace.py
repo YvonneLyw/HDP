@@ -535,11 +535,22 @@ class TrainWorkspace(BaseWorkspace):
                                 step_log['train_branch_score_B'] = pred_out['branch_score_B'].mean().item()
                             if 'branch_select_source' in pred_out:
                                 branch_select_source = pred_out['branch_select_source']
-                                step_log['train_branch_select_source_err_ratio'] = ((branch_select_source == 0).float().mean().item())
-                                step_log['train_branch_select_source_q_ratio'] = ((branch_select_source == 1).float().mean().item())
-                                # step_log['train_branch_select_source_hybrid_linear_ratio'] = (
-                                #     (branch_select_source == 2).float().mean().item()
-                                # )
+                                if cfg.policy.branch_selector == 'doser':
+                                    step_log['train_branch_select_source_both_action_id_q_ratio'] = (
+                                        (branch_select_source == 0).float().mean().item()
+                                    )
+                                    step_log['train_branch_select_source_one_action_id_one_ood_ratio'] = (
+                                        (branch_select_source == 1).float().mean().item()
+                                    )
+                                    step_log['train_branch_select_source_both_action_ood_ratio'] = (
+                                        (branch_select_source == 2).float().mean().item()
+                                    )
+                                else :
+                                    step_log['train_branch_select_source_err_ratio'] = ((branch_select_source == 0).float().mean().item())
+                                    step_log['train_branch_select_source_q_ratio'] = ((branch_select_source == 1).float().mean().item())
+                                    step_log['train_branch_select_source_hybrid_linear_ratio'] = (
+                                        (branch_select_source == 2).float().mean().item()
+                                    )
                             if 'selected_branch_exec_ratio' in pred_out:
                                 selected_b_ratio = pred_out['selected_branch_exec_ratio'].mean().item()
                                 # step_log['train_selected_branch_exec_B_ratio'] = selected_b_ratio

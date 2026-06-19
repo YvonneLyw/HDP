@@ -367,9 +367,9 @@ class RobomimicRunner(BasePcdRunner):
         branch_score_A_trace = list()
         branch_score_B_trace = list()
         selected_branch_trace = list()
-        branch_select_source_err_trace = list()
-        branch_select_source_q_trace = list()
-        # branch_select_source_hybrid_linear_trace = list()
+        branch_select_source_0_trace = list()
+        branch_select_source_1_trace = list()
+        branch_select_source_2_trace = list()
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
@@ -499,9 +499,9 @@ class RobomimicRunner(BasePcdRunner):
                     selected_branch_trace.append(float(np_action_dict['selected_branch'].mean()))   ## (B,1) -> 标量 -> (循环次数,1)
                 if 'branch_select_source' in np_action_dict:
                     branch_select_source = np_action_dict['branch_select_source']
-                    branch_select_source_err_trace.append(float((branch_select_source == 0).mean()))
-                    branch_select_source_q_trace.append(float((branch_select_source == 1).mean()))
-                    # branch_select_source_hybrid_linear_trace.append(float((branch_select_source == 2).mean()))
+                    branch_select_source_0_trace.append(float((branch_select_source == 0).mean()))
+                    branch_select_source_1_trace.append(float((branch_select_source == 1).mean()))
+                    branch_select_source_2_trace.append(float((branch_select_source == 2).mean()))
 
                 # handle latency_steps, we discard the first n_latency_steps actions
                 # to simulate latency
@@ -591,14 +591,15 @@ class RobomimicRunner(BasePcdRunner):
                 'selected_branch_B_ratio',
                 title='Selected Branch B Ratio Trace',
             )
-        if len(branch_select_source_err_trace) > 0:
-            log_data['branch_select_source_err_ratio'] = float(np.mean(branch_select_source_err_trace))
-        if len(branch_select_source_q_trace) > 0:
-            log_data['branch_select_source_q_ratio'] = float(np.mean(branch_select_source_q_trace))
-        # if len(branch_select_source_hybrid_linear_trace) > 0:
-        #     log_data['branch_select_source_hybrid_linear_ratio'] = float(
-        #         np.mean(branch_select_source_hybrid_linear_trace)
-        #     )
+        if len(branch_select_source_0_trace) > 0:
+            if getattr(policy, 'branch_selector', None) == 'doser':
+                log_data['branch_select_source_both_action_id_q_ratio'] = float(np.mean(branch_select_source_0_trace))
+                log_data['branch_select_source_one_action_id_one_ood_ratio'] = float(np.mean(branch_select_source_1_trace))
+                log_data['branch_select_source_both_action_ood_ratio'] = float(np.mean(branch_select_source_2_trace))
+            else:
+                log_data['branch_select_source_err_ratio'] = float(np.mean(branch_select_source_0_trace))
+                log_data['branch_select_source_q_ratio'] = float(np.mean(branch_select_source_1_trace))
+                log_data['branch_select_source_hybrid_linear_ratio'] = float(np.mean(branch_select_source_2_trace))
 
         return log_data
     

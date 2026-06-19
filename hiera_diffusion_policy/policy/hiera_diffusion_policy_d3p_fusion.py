@@ -187,6 +187,10 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         self._agg_weight_buffer = None
         self._agg_branch_buffer = None
 
+    def needs_rollout_image_qpos(self) -> bool:
+        if self.mode == 'SINGLE':
+            return self.single_branch in ('B1', 'B2')
+        return True
 
     
     # =========================
@@ -1182,14 +1186,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             out['branch_score_B'] = selector_out['select_score_B'].unsqueeze(-1)   ## (B,1)
             if 'select_source' in selector_out:
                 out['branch_select_source'] = selector_out['select_source'].unsqueeze(-1)
-                # 0 = 比较 diffusion errors
-                # 1 = 比较 critic Q scores
-                # 2 = doser比较
-            if self.branch_selector == 'doser':
-                for key, value in selector_out.items():
-                    if key in ('select_B', 'select_score_A', 'select_score_B', 'select_source'):
-                        continue
-                    out[f'doser_{key}'] = value.unsqueeze(-1) if value.ndim == 1 else value
+                # 'hybrid_gate'模式： 0 = 比较 diffusion errors    1 = 比较 critic Q scores
+                # 'doser'模式：0 = A/B action 都 ID，按 Q 选择      1 = 一个 ID 一个 OOD    2 = A/B action 都 OOD，使用 state/value/fallback
             return out
 
         ## 直接按score选
@@ -1215,11 +1213,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         out['branch_score_B'] = selector_out['select_score_B'].unsqueeze(-1)   ## (B,1)
         if 'select_source' in selector_out:
             out['branch_select_source'] = selector_out['select_source'].unsqueeze(-1)
-        if self.branch_selector == 'doser':
-            for key, value in selector_out.items():
-                if key in ('select_B', 'select_score_A', 'select_score_B', 'select_source'):
-                    continue
-                out[f'doser_{key}'] = value.unsqueeze(-1) if value.ndim == 1 else value
+                # 'hybrid_gate'模式： 0 = 比较 diffusion errors    1 = 比较 critic Q scores
+                # 'doser'模式：0 = A/B action 都 ID，按 Q 选择      1 = 一个 ID 一个 OOD    2 = A/B action 都 OOD，使用 state/value/fallback
         return out
 
     # =========================

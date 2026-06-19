@@ -160,7 +160,14 @@ class BaseWorkspace:
         for key, value in payload_actor['state_dicts'].items():
             if key == 'model' or key == 'ema_model':
                 model_dict =  self.__dict__[key].state_dict()
-                actor_params = {k:v for k, v in value.items() if k.startswith('actor')}
+                ## actor_params = {k:v for k, v in value.items() if k.startswith('actor')}
+
+                actor_params = {
+                    k: v for k, v in value.items()
+                    if k.startswith('actor')
+                    or k.startswith('branch_condition_encoder')
+                    or k.startswith('dko')
+                }
                 model_dict.update(actor_params)
                 self.__dict__[key].load_state_dict(model_dict)
 

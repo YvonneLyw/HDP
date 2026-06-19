@@ -6,39 +6,6 @@ import torch.nn as nn
 from hiera_diffusion_policy.model.diffusion.doser_selector_components import LatentValueNet
 
 
-class PercentileCalibrator(nn.Module):
-    """
-    Converts raw reconstruction errors to empirical percentile ranks.
-
-    reference_errors should be computed on the offline training set after the
-    frozen detector has been trained. The returned percentile is in [0, 1].
-    """
-    def __init__(self, reference_errors: Optional[torch.Tensor] = None):
-        super().__init__()
-        if reference_errors is None:
-            self.register_buffer("reference_errors", torch.empty(0))
-        else:
-            ## 保存在离线训练集上计算出的 detector error [e1, e2, ..., eN]
-            ref = torch.as_tensor(reference_errors, dtype=torch.float32).reshape(-1)        ## 转换为一维并排序
-            self.register_buffer("reference_errors", torch.sort(ref).values)
-
-    def has_reference(self) -> bool:
-        return self.reference_errors.numel() > 0
-
-    @torch.no_grad()
-    def percentile(self, errors: torch.Tensor) -> torch.Tensor:
-        if not self.has_reference():
-            raise RuntimeError(
-                "PercentileCalibrator has no reference errors. "
-                "Compute detector errors on offline data and load them first."
-            )
-        ref = self.reference_errors.to(device=errors.device, dtype=errors.dtype)
-        flat = errors.reshape(-1)   ## 当前当前 error
-        ranks = torch.searchsorted(ref, flat, right=True).to(dtype=errors.dtype) ## 当前 error 在数组中的排序
-        percentile = ranks / float(ref.numel())     #### 当前 error 在数组中的percentile
-        return percentile.reshape_as(errors)
-
-
 class DoserBranchSelector(nn.Module):
     """
     Wrapper for DOSER-style A/B branch selection.
@@ -52,9 +19,6 @@ class DoserBranchSelector(nn.Module):
     Required detector output convention:
       action_detector.score(common, action) -> {"error": ..., "percentile": ...}
       detector.score(latent) -> {"error": ..., "percentile": ...}
-    If a custom detector returns only raw errors, attach a PercentileCalibrator
-    through set_components(); tuple/raw tensor fallback is intentionally not
-    supported.
     """
     def __init__(
         self,
@@ -85,41 +49,10 @@ class DoserBranchSelector(nn.Module):
         self.dynamics_model = None
         self.value_net = None
 
-        self.action_pct_calibrator = PercentileCalibrator()
-        self.state_pct_calibrator = PercentileCalibrator()
-
         if self.components_path not in (None, ""):
             self.load_components_from_checkpoint(self.components_path, map_location="cpu")
 
-    ## 注入预训练好的 action detector / dynamics / state detector / V net
-    def set_components(
-        self,
-        action_detector=None,
-        state_detector=None,
-        dynamics_model=None,
-        value_net=None,
-        action_pct_calibrator: Optional[PercentileCalibrator] = None,
-        state_pct_calibrator: Optional[PercentileCalibrator] = None,
-    ) -> None:
-        self.action_detector = action_detector
-        self.state_detector = state_detector
-        self.dynamics_model = dynamics_model
-        self.value_net = value_net
-        if action_pct_calibrator is not None:
-            self.action_pct_calibrator = action_pct_calibrator
-        if state_pct_calibrator is not None:
-            self.state_pct_calibrator = state_pct_calibrator
-
-        for module in (
-            self.action_detector,
-            self.state_detector,
-            self.dynamics_model,
-            self.value_net,
-        ):
-            if isinstance(module, nn.Module):
-                module.eval()
-                module.requires_grad_(False)
-
+    # 从保存的 checkpoint 中恢复 action detector / dynamics / state detector / V net
     def load_components_from_checkpoint(self, path: str, map_location="cpu") -> Dict:
         """
         Load the frozen selector components produced by
@@ -178,6 +111,7 @@ class DoserBranchSelector(nn.Module):
             hidden_dim=metadata.get("value_hidden_dim", 256),
         )
 
+        # 加载参数
         def load_detector_state(module, state_dict):
             reference_errors = state_dict.get("reference_errors", None)
             clean_state = {k: v for k, v in state_dict.items() if k != "reference_errors"}
@@ -190,12 +124,19 @@ class DoserBranchSelector(nn.Module):
         load_detector_state(state_detector, state_dicts["state_detector"])
         value_net.load_state_dict(state_dicts["value_net"])
 
-        self.set_components(
-            action_detector=action_detector,
-            state_detector=state_detector,
-            dynamics_model=dynamics_model,
-            value_net=value_net,
-        )
+        self.action_detector = action_detector
+        self.state_detector = state_detector
+        self.dynamics_model = dynamics_model
+        self.value_net = value_net
+
+        for module in (
+            self.action_detector,
+            self.state_detector,
+            self.dynamics_model,
+            self.value_net,
+        ):
+            module.eval()
+            module.requires_grad_(False)
         return payload
 
     ## 注入组件检查
@@ -203,15 +144,15 @@ class DoserBranchSelector(nn.Module):
         if module is None:
             raise RuntimeError(
                 f"DOSER branch selector requires frozen {name}. "
-                "Train/load it first and call set_components()."
+                "Train it first and load it from components_path."
             )
         return module
 
+#####################################################################################
     @torch.no_grad()
     def _score_detector(
         self,
         detector,
-        calibrator: PercentileCalibrator,
         threshold: float,
         *args,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -228,12 +169,14 @@ class DoserBranchSelector(nn.Module):
         is_id = raw.get("is_id", None)
         if error is None:
             raise RuntimeError("Detector score dict must contain 'error' or 'reconstruction_error'.")
+        if percentile is None:
+            raise RuntimeError(
+                "Detector score dict must contain calibrated 'percentile' or 'percentile_rank'. "
+                "Run detector calibration before using DOSER branch selection."
+            )
 
         error = error.reshape(-1)
-        if percentile is None:
-            percentile = calibrator.percentile(error)
-        else:
-            percentile = percentile.reshape(-1).to(device=error.device, dtype=error.dtype)
+        percentile = percentile.reshape(-1).to(device=error.device, dtype=error.dtype)
 
         if is_id is None:
             is_id = percentile <= threshold         ## id/ood判断
@@ -314,37 +257,35 @@ class DoserBranchSelector(nn.Module):
         aA_eval = aligned_A_norm[:, :int(Tr)]
         aB_eval = aligned_B_norm[:, :int(Tr)]
 
-        ## 第一步：判断动作是否 ID
+        # 判断 action 是否 ID
         error_A, p_A, id_A = self._score_detector(
             action_detector,
-            self.action_pct_calibrator,
             self.action_ood_percentile,
             common,
             aA_eval,
         )
         error_B, p_B, id_B = self._score_detector(
             action_detector,
-            self.action_pct_calibrator,
             self.action_ood_percentile,
             common,
             aB_eval,
         )
 
+        # 都id时判断 Q(a)
         q_A = self._compute_q_score(common, aA_eval, critic_target)
         q_B = self._compute_q_score(common, aB_eval, critic_target)
-
+        
+        # 判断 latent state z' 是否 ID （含 dyn.）
         zA_next, dyn_unc_A = self._predict_latent_transition(common, aA_eval)
         zB_next, dyn_unc_B = self._predict_latent_transition(common, aB_eval)
-
+    
         state_error_A, state_p_A, state_id_A = self._score_detector(
             state_detector,
-            self.state_pct_calibrator,
             self.state_ood_percentile,
             zA_next,
         )
         state_error_B, state_p_B, state_id_B = self._score_detector(
             state_detector,
-            self.state_pct_calibrator,
             self.state_ood_percentile,
             zB_next,
         )
@@ -355,48 +296,55 @@ class DoserBranchSelector(nn.Module):
             dyn_ok_A = torch.ones_like(state_id_A, dtype=torch.bool)
             dyn_ok_B = torch.ones_like(state_id_B, dtype=torch.bool)
 
+        ## V(z')
         v_A = self._compute_value(zA_next, common)
         v_B = self._compute_value(zB_next, common)
 
+        # 4种情况
         both_action_id = id_A & id_B
         a_id_b_ood = id_A & (~id_B)
         a_ood_b_id = (~id_A) & id_B
         both_action_ood = (~id_A) & (~id_B)
 
+        # select_B
+        #1
         select_B_both_action_id = q_B > (q_A + self.q_margin)
+        #2
         select_B_a_id_b_ood = state_id_B & dyn_ok_B & (v_B > (v_A + self.v_margin))
+        #3
         select_B_a_ood_b_id = ~(state_id_A & dyn_ok_A & (v_A > (v_B + self.v_margin)))
-
+        
         one_state_id = state_id_A ^ state_id_B
-        select_B_one_state_id = state_id_B & dyn_ok_B
-        select_B_both_state_id = v_B > (v_A + self.v_margin)
+        select_B_one_state_id = state_id_B & dyn_ok_B           ##情况4.1 action都ood, 但 stateB id, state_A ood
+        select_B_both_state_id = v_B > (v_A + self.v_margin)    ##情况4.2 action都ood, 但 stateB id, state_A id, V()B的高
         fallback_B = torch.ones_like(id_A, dtype=torch.bool) if self.fallback_when_both_ood == "B" \
-            else torch.zeros_like(id_A, dtype=torch.bool)
+            else torch.zeros_like(id_A, dtype=torch.bool)       ##情况4.3 action都ood, 但 stateB ood, state_A ood，fallback选B
+        #4
         select_B_both_action_ood = torch.where(
             one_state_id,
-            select_B_one_state_id,
+            select_B_one_state_id,  # 4.1
             torch.where(
-                state_id_A & state_id_B,
-                select_B_both_state_id,
-                fallback_B,
+                state_id_A & state_id_B,    #if
+                select_B_both_state_id,         #4.2
+                fallback_B,                 #else
             ),
         )
 
         select_B = torch.where(
             both_action_id,
-            select_B_both_action_id,
+            select_B_both_action_id,    #1
             torch.where(
                 a_id_b_ood,
-                select_B_a_id_b_ood,
+                select_B_a_id_b_ood,    #2
                 torch.where(
                     a_ood_b_id,
-                    select_B_a_ood_b_id,
-                    select_B_both_action_ood,
+                    select_B_a_ood_b_id,#3
+                    select_B_both_action_ood,   #else 4
                 ),
             ),
         )
 
-        score_A = torch.where(id_A, q_A, v_A)
+        score_A = torch.where(id_A, q_A, v_A)   # id：Q(a) ； OOD：V(z')
         score_B = torch.where(id_B, q_B, v_B)
 
         select_source = torch.full_like(p_A, 3, dtype=torch.long)
@@ -409,18 +357,21 @@ class DoserBranchSelector(nn.Module):
             "select_score_A": score_A,
             "select_score_B": score_B,
             "select_source": select_source,
+
             "action_error_A": error_A,
             "action_error_B": error_B,
             "action_percentile_A": p_A,
             "action_percentile_B": p_B,
             "action_id_A": id_A,
             "action_id_B": id_B,
+
             "state_error_A": state_error_A,
             "state_error_B": state_error_B,
             "state_percentile_A": state_p_A,
             "state_percentile_B": state_p_B,
             "state_id_A": state_id_A,
             "state_id_B": state_id_B,
+            
             "dynamics_uncertainty_A": dyn_unc_A,
             "dynamics_uncertainty_B": dyn_unc_B,
             "q_A": q_A,
