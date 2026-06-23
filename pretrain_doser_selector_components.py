@@ -51,7 +51,7 @@ except ImportError:
 
 DEFAULT_PRETRAIN_CFG = {
     "output_dir": "outputs/doser_selector_components",  # 输出文件 
-    "checkpoint_name": "doser_selector_components.ckpt",
+    "checkpoint_name": "doser_selector_components_pcd.ckpt",
     "critic_path": None,    # 必须加载 Critic ，因为 ValueNet 的训练 target 来自 Critic
     "require_critic_checkpoint": True,
     "train_epochs": 50,
@@ -65,6 +65,7 @@ DEFAULT_PRETRAIN_CFG = {
     "dynamics_hidden_dim": 256,
     "value_hidden_dim": 256,
     "action_detector_image_feat_dim": 64,
+    "action_detector_pcd_feat_dim": 64,
     "dynamics_image_feat_dim": 64,
 
     "time_embed_dim": 32,   # Detector score 配置
@@ -241,6 +242,7 @@ def _infer_dims(model, train_loader, device: torch.device) -> Dict[str, int]:
         "state_dim": int(common["state"].shape[-1]),
         "subgoal_dim": int(common["subgoal"].shape[-1]) if common.get("subgoal", None) is not None else 0,
         "qpos_dim": int(common["qpos_pair"].shape[-1]) if common.get("qpos_pair", None) is not None else 0,
+        "pcd_dim": int(common["pcd"].shape[-1]) if common.get("pcd", None) is not None else 0,
         "image_shape": tuple(int(x) for x in image.shape[2:]) if image is not None else None,
         "action_eval_dim": int(action_eval.reshape(action_eval.shape[0], -1).shape[-1]),    # [B, Tr * action_dim]
     }
@@ -255,8 +257,10 @@ def _build_components(dims: Dict[str, int], pre_cfg: OmegaConf, device: torch.de
         subgoal_dim=dims["subgoal_dim"],
         qpos_dim=dims["qpos_dim"],
         action_eval_dim=dims["action_eval_dim"],
+        pcd_dim=dims["pcd_dim"],
         image_shape=dims["image_shape"],
         image_feat_dim=pre_cfg.action_detector_image_feat_dim,
+        pcd_feat_dim=pre_cfg.action_detector_pcd_feat_dim,
         hidden_dim=pre_cfg.detector_hidden_dim,
         time_embed_dim=pre_cfg.time_embed_dim,
         score_samples=pre_cfg.score_samples,
@@ -436,6 +440,7 @@ def _save_components(
         "dynamics_hidden_dim": int(pre_cfg.dynamics_hidden_dim),
         "value_hidden_dim": int(pre_cfg.value_hidden_dim),
         "image_feat_dim": int(pre_cfg.action_detector_image_feat_dim),
+        "pcd_feat_dim": int(pre_cfg.action_detector_pcd_feat_dim),
         "dynamics_image_feat_dim": int(pre_cfg.dynamics_image_feat_dim),
         "time_embed_dim": int(pre_cfg.time_embed_dim),
         "score_samples": int(pre_cfg.score_samples),

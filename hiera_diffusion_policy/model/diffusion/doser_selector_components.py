@@ -4,6 +4,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from hiera_diffusion_policy.model.diffusion.pointcloud_encoder import (
+        PointNetEncoder as HDPPointNetEncoder,
+    )
+except ImportError:
+    HDPPointNetEncoder = None
+
 
 def _flatten_batch(x: torch.Tensor) -> torch.Tensor:
     return x.reshape(x.shape[0], -1)
@@ -53,47 +60,8 @@ class DenoisingMLP(nn.Module):
         return self.net(torch.cat((noisy_x, cond, t_emb), dim=-1))
 
 
-class LatentValueNet(nn.Module):
-    """
-    Standalone value network for DOSER-style branch arbitration.
 
-    It intentionally lives outside Critic2net. The intended first-version use is:
-      - dynamics predicts a latent successor z'
-      - state support detector evaluates the same z'
-      - this value net evaluates the same z'
-
-    First-version training happens in pretrain_doser_selector_components.py with
-    a frozen critic target. Later versions can move this into the critic/value
-    stage, but it should not be trained in the actor BC stage.
-    """
-    def __init__(self, latent_dim: int, subgoal_dim: int = 0, hidden_dim: int = 256):
-        super().__init__()
-        input_dim = int(latent_dim) + int(subgoal_dim)
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.subgoal_dim = int(subgoal_dim)
-
-    def forward(self, latent: torch.Tensor, subgoal: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if self.subgoal_dim > 0:
-            if subgoal is None:
-                raise RuntimeError("LatentValueNet requires subgoal but got None.")
-            x = torch.cat((latent, subgoal), dim=-1)
-        else:
-            x = latent
-        return self.net(x).squeeze(-1)
-
-    @staticmethod
-    def expectile_loss(diff: torch.Tensor, expectile: float) -> torch.Tensor:
-        weight = torch.where(diff > 0, expectile, 1.0 - expectile)
-        return (weight * diff.pow(2)).mean()
-
-
-# 把 reconstruction error 转成 percentile rank” 的功能
+# 把 reconstruction error 转成 percentile rank 的功能
 class EmpiricalPercentileMixin:
     def _init_reference_errors(self) -> None:
         self.register_buffer("reference_errors", torch.empty(0))
@@ -159,7 +127,62 @@ class CurrentImageEncoder(nn.Module):
         x = current_images.reshape(B, views * channels, height, width)
         return self.net(x)
 
+####### pcd ecoder 复用HDP/新建####
+class FallbackPointNetEncoder(nn.Module):
+    def __init__(self, input_dim: int, mlp_dims, pool: bool = True):
+        super().__init__()
+        last_dim = int(input_dim)
+        layers = []
+        for i, dim in enumerate(mlp_dims):
+            layers.append(nn.Conv1d(last_dim, int(dim), 1))
+            if i < len(mlp_dims) - 1:
+                layers.append(nn.ReLU())
+            last_dim = int(dim)
+        self.convs = nn.Sequential(*layers)
+        self.pool = bool(pool)
+        self.input_channel = int(input_dim)
+        self.out_dim = int(mlp_dims[-1])
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.transpose(1, 2).contiguous()
+        B = x.shape[0]
+        x = self.convs(x)
+        if self.pool:
+            x = torch.max(x, 2, keepdim=True)[0]
+            x = x.view(B, -1)
+        return x
+
+
+class CurrentPcdEncoder(nn.Module):
+    def __init__(
+        self,
+        pcd_dim: int,
+        output_dim: int = 64,
+        hidden_dim: int = 128,
+    ):
+        super().__init__()
+        self.pcd_dim = int(pcd_dim)
+        self.output_dim = int(output_dim)
+        pointnet_cls = HDPPointNetEncoder if HDPPointNetEncoder is not None else FallbackPointNetEncoder
+        self.net = pointnet_cls(
+            input_dim=self.pcd_dim,
+            mlp_dims=[int(hidden_dim), self.output_dim],
+            pool=True,
+        )
+
+    def forward(self, pcd: torch.Tensor) -> torch.Tensor:
+        if pcd.dim() == 4:
+            B, H, N, D = pcd.shape
+            pcd = pcd.transpose(1, 2).reshape(B, N, H * D)
+        elif pcd.dim() != 3:
+            raise RuntimeError(f"pcd must be (B,N,D) or (B,H,N,D), got {tuple(pcd.shape)}")
+        if pcd.shape[-1] != self.pcd_dim:
+            raise RuntimeError(
+                f"pcd feature dim mismatch: expected {self.pcd_dim}, got {pcd.shape[-1]}"
+            )
+        return self.net(pcd)
+
+##############################################################################################
 class FullStateActionDetector(nn.Module, EmpiricalPercentileMixin):
     """
     Shared full-state action support detector.
@@ -177,8 +200,10 @@ class FullStateActionDetector(nn.Module, EmpiricalPercentileMixin):
         subgoal_dim: int,
         qpos_dim: int,
         action_eval_dim: int,
+        pcd_dim: int = 0,
         image_shape: Optional[Tuple[int, int, int, int]] = None,
         image_feat_dim: int = 64,
+        pcd_feat_dim: int = 64,
         hidden_dim: int = 256,
         time_embed_dim: int = 32,
         min_sigma: float = 0.01,
@@ -189,13 +214,20 @@ class FullStateActionDetector(nn.Module, EmpiricalPercentileMixin):
         self.state_dim = int(state_dim)
         self.subgoal_dim = int(subgoal_dim)
         self.qpos_dim = int(qpos_dim)
+        self.pcd_dim = int(pcd_dim)
         self.action_eval_dim = int(action_eval_dim)
         self.image_shape = tuple(image_shape) if image_shape is not None else None
         self.image_feat_dim = int(image_feat_dim) if self.image_shape is not None else 0
+        self.pcd_feat_dim = int(pcd_feat_dim) if self.pcd_dim > 0 else 0
         self.min_sigma = float(min_sigma)
         self.max_sigma = float(max_sigma)
         self.score_samples = int(score_samples)
 
+        self.pcd_encoder = (
+            CurrentPcdEncoder(self.pcd_dim, self.pcd_feat_dim)
+            if self.pcd_dim > 0 and self.pcd_feat_dim > 0
+            else None
+        )
         self.image_encoder = (
             CurrentImageEncoder(self.image_shape, self.image_feat_dim)
             if self.image_shape is not None and self.image_feat_dim > 0
@@ -203,7 +235,13 @@ class FullStateActionDetector(nn.Module, EmpiricalPercentileMixin):
         )
         self.denoiser = DenoisingMLP(
             input_dim=self.action_eval_dim,
-            cond_dim=self.state_dim + self.subgoal_dim + self.qpos_dim + self.image_feat_dim,
+            cond_dim=(
+                self.state_dim
+                + self.subgoal_dim
+                + self.qpos_dim
+                + self.pcd_feat_dim
+                + self.image_feat_dim
+            ),
             hidden_dim=hidden_dim,
             time_embed_dim=time_embed_dim,
         )
@@ -226,6 +264,13 @@ class FullStateActionDetector(nn.Module, EmpiricalPercentileMixin):
                 raise RuntimeError("FullStateActionDetector was trained with qpos, but common['qpos_pair'] is missing.")
             qpos = qpos_pair[:, 0] if qpos_pair.dim() == 3 else qpos_pair
             parts.append(qpos.reshape(B, -1).to(device=like.device, dtype=like.dtype))
+
+        if self.pcd_encoder is not None:
+            pcd = common.get("pcd", None)
+            if pcd is None:
+                raise RuntimeError("FullStateActionDetector was trained with pcd, but common['pcd'] is missing.")
+            pcd_feat = self.pcd_encoder(pcd.to(device=like.device, dtype=like.dtype))
+            parts.append(pcd_feat)
 
         if self.image_encoder is not None:
             images = common.get("image_pair", None)
@@ -445,3 +490,43 @@ class LatentStateDetector(nn.Module, EmpiricalPercentileMixin):
         if self.has_reference_errors():
             out["percentile"] = self.percentile(error)
         return out
+
+class LatentValueNet(nn.Module):
+    """
+    Standalone value network for DOSER-style branch arbitration.
+
+    It intentionally lives outside Critic2net. The intended first-version use is:
+      - dynamics predicts a latent successor z'
+      - state support detector evaluates the same z'
+      - this value net evaluates the same z'
+
+    First-version training happens in pretrain_doser_selector_components.py with
+    a frozen critic target. Later versions can move this into the critic/value
+    stage, but it should not be trained in the actor BC stage.
+    """
+    def __init__(self, latent_dim: int, subgoal_dim: int = 0, hidden_dim: int = 256):
+        super().__init__()
+        input_dim = int(latent_dim) + int(subgoal_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.subgoal_dim = int(subgoal_dim)
+
+    def forward(self, latent: torch.Tensor, subgoal: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.subgoal_dim > 0:
+            if subgoal is None:
+                raise RuntimeError("LatentValueNet requires subgoal but got None.")
+            x = torch.cat((latent, subgoal), dim=-1)
+        else:
+            x = latent
+        return self.net(x).squeeze(-1)
+
+    @staticmethod
+    def expectile_loss(diff: torch.Tensor, expectile: float) -> torch.Tensor:
+        weight = torch.where(diff > 0, expectile, 1.0 - expectile)
+        return (weight * diff.pow(2)).mean()
+
