@@ -11,7 +11,8 @@ python pretrain_doser_selector_components.py --config-name=hdp_d3p_can_ph \
   critic_path=/path/to/critic_run \
   +doser_pretrain.output_dir=outputs/doser_selector_components \
   +doser_pretrain.max_train_episodes=50 \
-  +doser_pretrain.train_epochs=50
+  +doser_pretrain.stage1_epochs=50 \
+  +doser_pretrain.stage2_epochs=50
 """
 
 if __name__ == "__main__":
@@ -51,14 +52,18 @@ except ImportError:
 
 DEFAULT_PRETRAIN_CFG = {
     "output_dir": "outputs/doser_selector_components",  # 输出文件 
-    "checkpoint_name": "doser_selector_components_pcd.ckpt",
+    "checkpoint_name": "doser_selector_components_pcd_staged.ckpt",
     "critic_path": None,    # 必须加载 Critic ，因为 ValueNet 的训练 target 来自 Critic
     "require_critic_checkpoint": True,
-    "train_epochs": 50,
+    # If stage-specific values are unset, train_epochs is used for each stage.
+    "train_epochs": 500,
+    "stage1_epochs": None,
+    "stage2_epochs": None,
     "max_train_episodes": None,
     "max_train_steps": None,
     "max_batches_per_epoch": None,
     "calibration_batches": None,
+    "validation_batches": None,
 
     "latent_dim": 128,
     "detector_hidden_dim": 256,
@@ -77,6 +82,7 @@ DEFAULT_PRETRAIN_CFG = {
     "action_loss_weight": 1.0, 
     "dynamics_loss_weight": 1.0,
     "dynamics_recon_loss_weight": 0.1,  # Dynamics 模型中“状态自编码重建损失” （encoder 必须让 latent 保留足够的信息）
+    "dynamics_state_loss_weight": 1.0,
     "state_loss_weight": 1.0,
     "value_loss_weight": 1.0,
 
@@ -202,6 +208,18 @@ def _instantiate_policy_and_data(cfg: OmegaConf, pre_cfg: OmegaConf, device: tor
     model.requires_grad_(False)
     # 创建训练 DataLoader：取一个 batch 推断网络输入维度，训练模型参数
     train_loader = DataLoader(dataset, **OmegaConf.to_container(cfg.dataloader, resolve=True))
+    # 创建val DataLoader：
+    val_dataset = dataset.get_validation_dataset()
+    if len(val_dataset) == 0:
+        raise RuntimeError(
+            "DOSER dynamics validation set is empty. Increase task.dataset.val_ratio "
+            "so at least one complete demo is reserved for validation."
+        )
+    val_loader_cfg = cfg.val_dataloader if "val_dataloader" in cfg else cfg.dataloader_noshuff
+    val_loader = DataLoader(
+        val_dataset,
+        **OmegaConf.to_container(val_loader_cfg, resolve=True),
+    )
     # calib_loader（不打乱）：训练完成后统计 reference errors
     if "dataloader_noshuff" in cfg:
         calib_loader = DataLoader(dataset, **OmegaConf.to_container(cfg.dataloader_noshuff, resolve=True))
@@ -210,7 +228,7 @@ def _instantiate_policy_and_data(cfg: OmegaConf, pre_cfg: OmegaConf, device: tor
         calib_cfg["shuffle"] = False
         calib_cfg["drop_last"] = False
         calib_loader = DataLoader(dataset, **calib_cfg)
-    return model, train_loader, calib_loader
+    return model, train_loader, calib_loader, val_loader
 
 def _prepare_selector_batch(model, batch: Dict[str, torch.Tensor]):
     with torch.no_grad():
@@ -248,7 +266,7 @@ def _infer_dims(model, train_loader, device: torch.device) -> Dict[str, int]:
     }
 
 
-########################核心################################
+########################################### 核心 ##########################################
 def _build_components(dims: Dict[str, int], pre_cfg: OmegaConf, device: torch.device):
     if dims["image_shape"] is None:
         raise RuntimeError("DOSER selector pretraining requires image observations.")
@@ -289,7 +307,26 @@ def _build_components(dims: Dict[str, int], pre_cfg: OmegaConf, device: torch.de
     return action_detector, dynamics_model, state_detector, value_net
 
 
-def _train_components(
+def _set_module_trainable(module: torch.nn.Module, trainable: bool) -> None:
+    module.train(trainable)
+    module.requires_grad_(trainable)
+
+
+def _stage_epochs(pre_cfg: OmegaConf, key: str) -> int:
+    value = pre_cfg.get(key, None)
+    return int(pre_cfg.train_epochs if value is None else value)
+
+
+def _stage_limit_reached(pre_cfg: OmegaConf, step: int, batch_idx: int) -> bool:
+    if pre_cfg.max_train_steps is not None and step >= int(pre_cfg.max_train_steps):
+        return True
+    return (
+        pre_cfg.max_batches_per_epoch is not None
+        and batch_idx >= int(pre_cfg.max_batches_per_epoch)
+    )
+
+################## stage1：Action Detector + Dynamics #####################
+def _train_action_and_dynamics(
     model,
     train_loader,
     components,
@@ -297,56 +334,120 @@ def _train_components(
     device: torch.device,
 ) -> None:
     action_detector, dynamics_model, state_detector, value_net = components
-    # 一个 optimizer 管理全部参数
-    params = []
-    for module in components:
-        params.extend(module.parameters())
-    optimizer = AdamW(params, lr=pre_cfg.lr, weight_decay=pre_cfg.weight_decay)
-
-    global_step = 0
-    max_train_steps = pre_cfg.max_train_steps
-    for epoch in range(int(pre_cfg.train_epochs)):
-        losses = []
-        pbar = tqdm.tqdm(train_loader, desc=f"DOSER selector pretrain epoch {epoch}", leave=False)
+    _set_module_trainable(action_detector, True)
+    _set_module_trainable(dynamics_model, True)
+    _set_module_trainable(state_detector, False)
+    _set_module_trainable(value_net, False)
+    # 仅 action_detector 和 dynamics_model
+    optimizer = AdamW(
+        list(action_detector.parameters()) + list(dynamics_model.parameters()),
+        lr=pre_cfg.lr,
+        weight_decay=pre_cfg.weight_decay,
+    )
+    step = 0
+    for epoch in range(_stage_epochs(pre_cfg, "stage1_epochs")):
+        pbar = tqdm.tqdm(
+            train_loader,
+            desc=f"DOSER stage 1 action+dynamics epoch {epoch}",
+            leave=False,
+        )
         for batch_idx, batch in enumerate(pbar):
-            if max_train_steps is not None and global_step >= int(max_train_steps):
-                return
-            if pre_cfg.max_batches_per_epoch is not None and batch_idx >= int(pre_cfg.max_batches_per_epoch):
+            if _stage_limit_reached(pre_cfg, step, batch_idx):
+                if pre_cfg.max_train_steps is not None and step >= int(pre_cfg.max_train_steps):
+                    return
                 break
 
-            batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
             # 准备训练数据
+            batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
             common, action_eval, next_state, next_subgoal, next_image = _prepare_selector_batch(model, batch)
-            # if dynamics_model.image_encoder is not None and next_image is None:
-            #     raise RuntimeError("LatentDynamicsModel uses images, but Tr-aligned next image is missing.")
-
-            # action_loss
+            
+            # action_loss ###########
             action_loss = action_detector.denoising_loss(common, action_eval)
 
-            # 构造当前和下一状态 latent
-            z_current = dynamics_model.encode(common=common)
-            z_next = dynamics_model.encode(state=next_state, subgoal=next_subgoal, image=next_image)
-            # dynamics_loss & dynamics_recon_loss
-            pred_next = dynamics_model(common, action_eval)["next_latent"]
-            dynamics_loss = F.mse_loss(pred_next, z_next.detach())
+            # dynamics_loss & dynamics_recon_loss & dynamics_state_loss ###########
+            z_next = dynamics_model.encode(
+                state=next_state,
+                subgoal=next_subgoal,
+                image=next_image,
+            )   # 下一状态 latent
+            dynamics_out = dynamics_model(common, action_eval)
+            dynamics_loss = F.mse_loss(dynamics_out["next_latent"], z_next.detach())
+            dynamics_state_loss = F.mse_loss(dynamics_out["next_state"], next_state)    #新增 next_state_head（dynamics_state_loss）
+            current_image = common.get("doser_image_pair", None)
+            if current_image is None:
+                current_image = common.get("image_pair", None)
             dynamics_recon_loss = 0.5 * (
                 dynamics_model.reconstruction_loss(
                     common["state"],
                     common.get("subgoal", None),
-                    common.get("doser_image_pair", None)
-                    if common.get("doser_image_pair", None) is not None
-                    else common.get("image_pair", None),
+                    current_image,
                 )
                 + dynamics_model.reconstruction_loss(next_state, next_subgoal, next_image)
+            )   # encoder
+
+            loss = (
+                float(pre_cfg.action_loss_weight) * action_loss
+                + float(pre_cfg.dynamics_loss_weight) * dynamics_loss
+                + float(pre_cfg.dynamics_recon_loss_weight) * dynamics_recon_loss
+                + float(pre_cfg.dynamics_state_loss_weight) * dynamics_state_loss
             )
 
-            # state_loss
-            state_loss = state_detector.denoising_loss(
-                torch.cat((z_current.detach(), z_next.detach()), dim=0)
-            )
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
 
-            # value_loss
+            pbar.set_postfix(
+                loss=f"{float(loss.detach().item()):.4f}",
+                action=f"{float(action_loss.detach().item()):.4f}",
+                dyn=f"{float(dynamics_loss.detach().item()):.4f}",
+                state_pred=f"{float(dynamics_state_loss.detach().item()):.4f}",
+                recon=f"{float(dynamics_recon_loss.detach().item()):.4f}",
+            )
+            step += 1
+
+################## stage2：State Detector + ValueNet #####################
+def _train_state_detector_and_value(
+    model,
+    train_loader,
+    components,
+    pre_cfg: OmegaConf,
+    device: torch.device,
+) -> None:
+    action_detector, dynamics_model, state_detector, value_net = components
+    _set_module_trainable(action_detector, False)
+    _set_module_trainable(dynamics_model, False)
+    _set_module_trainable(state_detector, True)
+    _set_module_trainable(value_net, True)
+
+    optimizer = AdamW(
+        list(state_detector.parameters()) + list(value_net.parameters()),
+        lr=pre_cfg.lr,
+        weight_decay=pre_cfg.weight_decay,
+    )
+    step = 0
+    for epoch in range(_stage_epochs(pre_cfg, "stage2_epochs")):
+        pbar = tqdm.tqdm(
+            train_loader,
+            desc=f"DOSER stage 2 state+value epoch {epoch}",
+            leave=False,
+        )
+        for batch_idx, batch in enumerate(pbar):
+            if _stage_limit_reached(pre_cfg, step, batch_idx):
+                if pre_cfg.max_train_steps is not None and step >= int(pre_cfg.max_train_steps):
+                    return
+                break
+
+            batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+            common, action_eval, next_state, next_subgoal, next_image = _prepare_selector_batch(model, batch)
             with torch.no_grad():
+                # 构造当前和下一状态 latent
+                z_current = dynamics_model.encode(common=common)
+                z_next = dynamics_model.encode(
+                    state=next_state,
+                    subgoal=next_subgoal,
+                    image=next_image,
+                )
+
                 q1, q2 = model.critic_target(
                     common["pcd"],
                     common["state"],
@@ -354,15 +455,20 @@ def _train_components(
                     action_eval.reshape(action_eval.shape[0], -1),
                 )
                 q_target = torch.minimum(q1.squeeze(-1), q2.squeeze(-1))
+            # state_loss #########
+            state_loss = state_detector.denoising_loss(
+                torch.cat((z_current, z_next), dim=0)
+            )
+            # value_loss #########
             value_subgoal = common.get("subgoal", None) if int(pre_cfg.value_subgoal_dim) > 0 else None
-            value_pred = value_net(z_current.detach(), value_subgoal)
-            value_loss = value_net.expectile_loss(q_target - value_pred, float(pre_cfg.value_expectile))
+            value_pred = value_net(z_current, value_subgoal)
+            value_loss = value_net.expectile_loss(
+                q_target - value_pred,
+                float(pre_cfg.value_expectile),
+            )
 
             loss = (
-                float(pre_cfg.action_loss_weight) * action_loss
-                + float(pre_cfg.dynamics_loss_weight) * dynamics_loss
-                + float(pre_cfg.dynamics_recon_loss_weight) * dynamics_recon_loss
-                + float(pre_cfg.state_loss_weight) * state_loss
+                float(pre_cfg.state_loss_weight) * state_loss
                 + float(pre_cfg.value_loss_weight) * value_loss
             )
 
@@ -370,19 +476,25 @@ def _train_components(
             loss.backward()
             optimizer.step()
 
-            losses.append(float(loss.detach().item()))
             pbar.set_postfix(
-                loss=f"{losses[-1]:.4f}",
-                action=f"{float(action_loss.detach().item()):.4f}",
-                dyn=f"{float(dynamics_loss.detach().item()):.4f}",
-                # 进度条补充 dynamics_recon_loss 和 state_loss。
-                recon=f"{float(dynamics_recon_loss.detach().item()):.4f}",
+                loss=f"{float(loss.detach().item()):.4f}",
                 state=f"{float(state_loss.detach().item()):.4f}",
                 value=f"{float(value_loss.detach().item()):.4f}",
             )
-            global_step += 1
+            step += 1
 
 
+def _train_components(
+    model,
+    train_loader,
+    components,
+    pre_cfg: OmegaConf,
+    device: torch.device,
+) -> None:
+    _train_action_and_dynamics(model, train_loader, components, pre_cfg, device)
+    _train_state_detector_and_value(model, train_loader, components, pre_cfg, device)
+
+################## calibration #####################
 @torch.no_grad()        # 不反传，不修改模型参数
 def _calibrate_components(model, calib_loader, components, pre_cfg: OmegaConf, device: torch.device):
     action_detector, dynamics_model, state_detector, _ = components
@@ -415,6 +527,98 @@ def _calibrate_components(model, calib_loader, components, pre_cfg: OmegaConf, d
     state_detector.set_reference_errors(state_errors)
     return action_errors, state_errors
 
+################## validation #####################
+@torch.no_grad()
+def _validate_components(
+    model,
+    val_loader,
+    components,
+    pre_cfg: OmegaConf,
+    device: torch.device,
+    state_ood_percentile: float,
+) -> Dict[str, float]:
+    action_detector, dynamics_model, state_detector, value_net = components
+    for module in components:
+        module.eval()
+
+    metric_sums = {
+        "val_dyn_latent_mse": 0.0,
+        "val_dyn_copy_baseline_mse": 0.0,
+        "val_dyn_next_state_mse": 0.0,
+        "val_state_id_agreement": 0.0,
+        "val_pred_state_id_rate": 0.0,
+        "val_true_state_id_rate": 0.0,
+        "val_value_pred_true_next_mae": 0.0,
+        "val_value_current_q_mae": 0.0,
+    }
+    sample_count = 0
+    pbar = tqdm.tqdm(val_loader, desc="Validating DOSER dynamics", leave=False)
+    for batch_idx, batch in enumerate(pbar):
+        if pre_cfg.validation_batches is not None and batch_idx >= int(pre_cfg.validation_batches):
+            break
+        batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+        common, action_eval, next_state, next_subgoal, next_image = _prepare_selector_batch(model, batch)
+
+        z_current = dynamics_model.encode(common=common)
+        z_next = dynamics_model.encode(
+            state=next_state,
+            subgoal=next_subgoal,
+            image=next_image,
+        )
+        dynamics_out = dynamics_model(common, action_eval)
+        pred_z_next = dynamics_out["next_latent"]
+        pred_next_state = dynamics_out["next_state"]
+
+        pred_state_score = state_detector.score(pred_z_next)
+        true_state_score = state_detector.score(z_next)
+        pred_state_id = pred_state_score["percentile"] <= float(state_ood_percentile)
+        true_state_id = true_state_score["percentile"] <= float(state_ood_percentile)
+
+        value_subgoal = common.get("subgoal", None) if int(pre_cfg.value_subgoal_dim) > 0 else None
+        pred_next_value = value_net(pred_z_next, value_subgoal)
+        true_next_value = value_net(z_next, value_subgoal)
+        current_value = value_net(z_current, value_subgoal)
+        q1, q2 = model.critic_target(
+            common["pcd"],
+            common["state"],
+            common["subgoal"],
+            action_eval.reshape(action_eval.shape[0], -1),
+        )
+        q_target = torch.minimum(q1.squeeze(-1), q2.squeeze(-1))
+
+        batch_size = int(action_eval.shape[0])
+        batch_metrics = {
+            "val_dyn_latent_mse": F.mse_loss(pred_z_next, z_next),
+            "val_dyn_copy_baseline_mse": F.mse_loss(z_current, z_next),     # 直接令 z'=z_t 的简单 baseline
+            "val_dyn_next_state_mse": F.mse_loss(pred_next_state, next_state),
+            "val_state_id_agreement": (pred_state_id == true_state_id).float().mean(),
+            "val_pred_state_id_rate": pred_state_id.float().mean(),
+            "val_true_state_id_rate": true_state_id.float().mean(),
+            "val_value_pred_true_next_mae": (pred_next_value - true_next_value).abs().mean(),   #V(pred_z') 与 V(true_z') 的差距
+            "val_value_current_q_mae": (current_value - q_target).abs().mean(),
+        }
+        for key, value in batch_metrics.items():
+            metric_sums[key] += float(value.item()) * batch_size
+        sample_count += batch_size
+
+    if sample_count == 0:
+        raise RuntimeError("DOSER dynamics validation produced no samples.")
+
+    metrics = {
+        key: value / float(sample_count)
+        for key, value in metric_sums.items()
+    }
+    copy_mse = metrics["val_dyn_copy_baseline_mse"]
+    metrics["val_dyn_vs_copy_ratio"] = (
+        metrics["val_dyn_latent_mse"] / copy_mse
+        if copy_mse > 0.0
+        else float("inf")
+    )
+    metrics["val_samples"] = float(sample_count)
+    print("DOSER validation metrics:")
+    print(OmegaConf.to_yaml(OmegaConf.create(metrics)))
+    return metrics
+
 
 def _save_components(
     cfg: OmegaConf,
@@ -422,6 +626,7 @@ def _save_components(
     dims: Dict[str, int],
     components,
     reference_errors,
+    validation_metrics: Dict[str, float],
 ) -> pathlib.Path:
     action_detector, dynamics_model, state_detector, value_net = components
     action_errors, state_errors = reference_errors  # 未排序
@@ -435,6 +640,7 @@ def _save_components(
     # 网络结构
     metadata = {
         **dims,
+        "format_version": 2,
         "latent_dim": int(pre_cfg.latent_dim),
         "detector_hidden_dim": int(pre_cfg.detector_hidden_dim),
         "dynamics_hidden_dim": int(pre_cfg.dynamics_hidden_dim),
@@ -475,11 +681,12 @@ def _save_components(
             "action": action_errors,
             "state": state_errors,
         },
+        "validation_metrics": validation_metrics,
     }
     torch.save(payload, output_path.open("wb"), pickle_module=pickle)
     return output_path
 
-##########################入口#############################
+##########################入口##############################################################################
 @hydra.main(
     version_base=None,
     config_path=str(pathlib.Path(__file__).parent.joinpath("hiera_diffusion_policy", "config")),
@@ -492,10 +699,22 @@ def main(cfg: OmegaConf):
         OmegaConf.create(DEFAULT_PRETRAIN_CFG),
         cfg.get("doser_pretrain", {}),
     )   # 最终： pre_cfg.xxxxxx = xxxx
+
+    if not 0.0 < float(pre_cfg.value_expectile) < 1.0:
+        raise ValueError(
+            f"doser_pretrain.value_expectile must be in (0, 1), got {pre_cfg.value_expectile}."
+        )
+    for key in ("stage1_epochs", "stage2_epochs"):
+        if _stage_epochs(pre_cfg, key) < 0:
+            raise ValueError(f"doser_pretrain.{key} must be non-negative.")
     device = torch.device(cfg.training.device)
 
     # 实例化完整 Policy（Guider、Actor 和 Critic）为了复用接口方法 和 DataLoader
-    model, train_loader, calib_loader = _instantiate_policy_and_data(cfg, pre_cfg, device)
+    model, train_loader, calib_loader, val_loader = _instantiate_policy_and_data(
+        cfg,
+        pre_cfg,
+        device,
+    )
 
     # 加载已经训练好的 Critic
     critic_path = _resolve_checkpoint_path(
@@ -521,9 +740,28 @@ def main(cfg: OmegaConf):
 
     components = _build_components(dims, pre_cfg, device)
 
+    # 分 2 stage 训练
     _train_components(model, train_loader, components, pre_cfg, device)
+    # calibration
     reference_errors = _calibrate_components(model, calib_loader, components, pre_cfg, device)
-    output_path = _save_components(cfg, pre_cfg, dims, components, reference_errors)
+    # validation
+    selector_cfg = cfg.policy.get("doser_selector", {})
+    validation_metrics = _validate_components(
+        model,
+        val_loader,
+        components,
+        pre_cfg,
+        device,
+        state_ood_percentile=float(selector_cfg.get("state_ood_percentile", 0.95)),
+    )
+    output_path = _save_components(
+        cfg,
+        pre_cfg,
+        dims,
+        components,
+        reference_errors,
+        validation_metrics, # 新增
+    )
 
     print(f"Saved DOSER selector components to: {output_path}")
     print(f"Metadata: {OmegaConf.to_yaml(OmegaConf.create({**dims, 'latent_dim': pre_cfg.latent_dim}))}")

@@ -75,6 +75,12 @@ class DoserBranchSelector(nn.Module):
         payload = torch.load(ckpt_path.open("rb"), pickle_module=dill, map_location=map_location)
         metadata = payload["metadata"]
         state_dicts = payload["state_dicts"]
+        if int(metadata.get("format_version", 1)) < 2:
+            raise RuntimeError(
+                "This DOSER components checkpoint predates staged dynamics training "
+                "and the next-state auxiliary head. Re-run "
+                "pretrain_doser_selector_components.py to create a format_version=2 checkpoint."
+            )
         image_shape = metadata.get("image_shape", None)
         if image_shape is None:
             raise RuntimeError("DOSER selector checkpoint metadata must contain image_shape.")
@@ -309,26 +315,28 @@ class DoserBranchSelector(nn.Module):
         both_action_ood = (~id_A) & (~id_B)
 
         # select_B
-        #1
+        # 情况1
         select_B_both_action_id = q_B > (q_A + self.q_margin)
-        #2
+        # 情况2
         select_B_a_id_b_ood = state_id_B & dyn_ok_B & (v_B > (v_A + self.v_margin))
-        #3
+        # 情况3
         select_B_a_ood_b_id = ~(state_id_A & dyn_ok_A & (v_A > (v_B + self.v_margin)))
         
-        one_state_id = state_id_A ^ state_id_B
-        select_B_one_state_id = state_id_B & dyn_ok_B           ##情况4.1 action都ood, 但 stateB id, state_A ood
-        select_B_both_state_id = v_B > (v_A + self.v_margin)    ##情况4.2 action都ood, 但 stateB id, state_A id, V()B的高
+        # 加入dyn可信度
+        trusted_state_A = state_id_A & dyn_ok_A
+        trusted_state_B = state_id_B & dyn_ok_B
+        select_B_one_trusted_state = trusted_state_B            ##情况4.1 action都ood, 但 stateB id（且可信）, state_A ood（或不可信）
+        select_B_both_trusted_state = v_B > (v_A + self.v_margin)##情况4.2 action都ood, 但 stateB id, state_A id, V()B的高
         fallback_B = torch.ones_like(id_A, dtype=torch.bool) if self.fallback_when_both_ood == "B" \
             else torch.zeros_like(id_A, dtype=torch.bool)       ##情况4.3 action都ood, 但 stateB ood, state_A ood，fallback选B
-        #4
+        # 情况4
         select_B_both_action_ood = torch.where(
-            one_state_id,
-            select_B_one_state_id,  # 4.1
-            torch.where(
-                state_id_A & state_id_B,    #if
-                select_B_both_state_id,         #4.2
-                fallback_B,                 #else
+            trusted_state_A ^ trusted_state_B,      #if A/B 只有一个是 trusted
+            select_B_one_trusted_state,                 # 4.1
+            torch.where(                            #else
+                trusted_state_A & trusted_state_B,  #if A/B 两个都 trusted
+                select_B_both_trusted_state,            # 4.2
+                fallback_B,                         #else 4.3
             ),
         )
 

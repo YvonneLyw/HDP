@@ -332,8 +332,8 @@ class LatentDynamicsModel(nn.Module):
     """
     Latent dynamics over normalized state/subgoal plus optional current images.
 
-    The decoder is used only during pretraining to keep the latent from
-    collapsing. Rollout only calls forward(...)->next_latent.
+    The decoder and next-state head are used during pretraining to keep the
+    latent informative. Rollout only consumes forward(...)->next_latent.
     """
     def __init__(
         self,
@@ -377,6 +377,11 @@ class LatentDynamicsModel(nn.Module):
             nn.Mish(),
             nn.Linear(hidden_dim, self.latent_dim),
         )
+        self.next_state_head = nn.Sequential(
+            nn.Linear(self.latent_dim, hidden_dim),
+            nn.Mish(),
+            nn.Linear(hidden_dim, self.state_dim),
+        )#####################新增next_state_head###########################
 
     def _obs_feature(
         self,
@@ -424,12 +429,17 @@ class LatentDynamicsModel(nn.Module):
         recon = self.decoder(self.encoder(obs))
         return F.mse_loss(recon, obs)
 
+    #####################新增next_state_head###########################
     def forward(self, common: Dict[str, Optional[torch.Tensor]], action_eval: torch.Tensor) -> Dict[str, torch.Tensor]:
         z = self.encode(common=common)
         action_flat = _flatten_batch(action_eval)
         next_latent = self.transition(torch.cat((z, action_flat), dim=-1))
         uncertainty = torch.zeros(next_latent.shape[0], device=next_latent.device, dtype=next_latent.dtype)
-        return {"next_latent": next_latent, "uncertainty": uncertainty}
+        return {
+            "next_latent": next_latent,
+            "next_state": self.next_state_head(next_latent),
+            "uncertainty": uncertainty,
+        }
 
 
 class LatentStateDetector(nn.Module, EmpiricalPercentileMixin):
@@ -529,4 +539,3 @@ class LatentValueNet(nn.Module):
     def expectile_loss(diff: torch.Tensor, expectile: float) -> torch.Tensor:
         weight = torch.where(diff > 0, expectile, 1.0 - expectile)
         return (weight * diff.pow(2)).mean()
-

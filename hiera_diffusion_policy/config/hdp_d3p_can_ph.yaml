@@ -169,9 +169,9 @@ policy:
   test_time_agg_tau: 0.1
   doser_selector:
     # Preferred: checkpoint produced by HDP/pretrain_doser_selector_components.py.
-    components_path: outputs/doser_selector_components/doser_selector_components_pcd_demo50.ckpt
-    action_ood_percentile: 0.95
-    state_ood_percentile: 0.95
+    components_path: outputs/doser_selector_components/doser_selector_components_pcd_staged_demo50.ckpt
+    action_ood_percentile: 0.98
+    state_ood_percentile: 0.98
     q_margin: 0.05
     v_margin: 0.05
     fallback_when_both_ood: A
