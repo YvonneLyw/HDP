@@ -179,11 +179,11 @@ policy:
     dynamics_uncertainty_threshold: 1000000000.0
   # Parallel ground-truth-state version. Enable with branch_selector=doser_gt.
   doser_gt_selector:
-    components_path: null
+    components_path: outputs/doser_selector_components/doser_selector_components_gt_demo50.ckpt
     action_ood_percentile: 0.98
     state_ood_percentile: 0.98
-    q_margin: 0.5
-    v_margin: 0.5
+    q_margin: 0.05
+    v_margin: 0.05
     fallback_when_both_ood: A
     require_dynamics_uncertainty: false
     dynamics_uncertainty_threshold: 1000000000.0

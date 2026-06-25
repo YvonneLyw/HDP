@@ -593,7 +593,7 @@ def _validate_components(
         batch_size = int(action_eval.shape[0])
         batch_metrics = {
             "val_dyn_latent_mse": F.mse_loss(pred_z_next, z_next),
-            "val_dyn_copy_baseline_mse": F.mse_loss(z_current, z_next),     # 直接令 z'=z_t 的简单 baseline
+            "val_dyn_copy_baseline_mse": F.mse_loss(z_current, z_next),     # 真z' <-> 真z（范围）
             "val_dyn_next_state_mse": F.mse_loss(pred_next_state, next_state),
             "val_state_id_agreement": (pred_state_id == true_state_id).float().mean(),
             "val_pred_state_id_rate": pred_state_id.float().mean(),

@@ -330,6 +330,7 @@ def _validate(model, loader, components, cfg, device, state_percentile):
         "val_dyn_state_copy_mse": 0.0,
         "val_dyn_qpos_copy_mse": 0.0,
         "val_state_id_agreement": 0.0,
+        "val_true_state_id_self_agreement": 0.0,
         "val_pred_state_id_rate": 0.0,
         "val_true_state_id_rate": 0.0,
         "val_value_pred_true_next_mae": 0.0,
@@ -360,8 +361,12 @@ def _validate(model, loader, components, cfg, device, state_percentile):
 
         pred_state_score = state_detector.score(pred_successor)
         true_state_score = state_detector.score(next_successor)
+        true_state_score_repeat = state_detector.score(next_successor)
         pred_state_id = pred_state_score["percentile"] <= float(state_percentile)
         true_state_id = true_state_score["percentile"] <= float(state_percentile)
+        true_state_id_repeat = (
+            true_state_score_repeat["percentile"] <= float(state_percentile)
+        )
 
         value_subgoal = common["subgoal"] if value_net.subgoal_dim > 0 else None
         pred_next_value = value_net(pred_successor, value_subgoal)
@@ -396,6 +401,9 @@ def _validate(model, loader, components, cfg, device, state_percentile):
                 next_qpos,
             ),
             "val_state_id_agreement": (pred_state_id == true_state_id).float().mean(),
+            "val_true_state_id_self_agreement": (
+                true_state_id == true_state_id_repeat
+            ).float().mean(),
             "val_pred_state_id_rate": pred_state_id.float().mean(),
             "val_true_state_id_rate": true_state_id.float().mean(),
             "val_value_pred_true_next_mae": (pred_next_value - true_next_value).abs().mean(),   #V(pred_s') 与 V(true_s') 的差距
