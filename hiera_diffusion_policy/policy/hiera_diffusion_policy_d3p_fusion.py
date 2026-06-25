@@ -11,6 +11,9 @@ except ImportError:
 from hiera_diffusion_policy.model.diffusion.branch_condition_encoder import BranchConditionEncoder
 from hiera_diffusion_policy.model.diffusion.d3p_koopman import DeepKoopmanModule
 from hiera_diffusion_policy.policy.doser_branch_selector import DoserBranchSelector
+from hiera_diffusion_policy.policy.doser_gt_branch_selector import (
+    GroundTruthDoserBranchSelector,
+)
 from hiera_diffusion_policy.policy.hiera_diffusion_policy import HieraDiffusionPolicy
 
 try:
@@ -65,6 +68,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         qpos_feat_dim: int = 9,
         image_size=(84, 84),
         doser_selector: Optional[Dict] = None,
+        doser_gt_selector: Optional[Dict] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -103,9 +107,10 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             raise ValueError(f"d3p_query_every is fixed to 4 in current fusion stage, got {self.d3p_query_every}")
         if self.d3p_rollout_error_samples < 1:
             raise ValueError(f"d3p_rollout_error_samples must be >= 1, got {self.d3p_rollout_error_samples}")
-        if self.branch_selector not in ('err', 'q', 'hybrid_gate', 'hybrid_linear', 'doser'):
+        if self.branch_selector not in ('err', 'q', 'hybrid_gate', 'hybrid_linear', 'doser', 'doser_gt'):
             raise ValueError(
-                "branch_selector must be one of ['err','q','hybrid_gate','hybrid_linear','doser'], "
+                "branch_selector must be one of "
+                "['err','q','hybrid_gate','hybrid_linear','doser','doser_gt'], "
                 f"got {self.branch_selector}"
             )
         if self.test_time_agg_beta <= 0.0:
@@ -164,7 +169,15 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         else:
             self.dko = None
         doser_selector_cfg = dict(doser_selector or {})
+        if self.branch_selector != 'doser':
+            doser_selector_cfg["components_path"] = None
         self.doser_selector = DoserBranchSelector(**doser_selector_cfg)
+        doser_gt_selector_cfg = dict(doser_gt_selector or {})
+        if self.branch_selector != 'doser_gt':
+            doser_gt_selector_cfg["components_path"] = None
+        self.doser_gt_selector = GroundTruthDoserBranchSelector(
+            **doser_gt_selector_cfg
+        )
         self._smoothing_prev_exec_norm: Optional[torch.Tensor] = None   ## 上一次最终执行的动作序列，用于判断这是不是当前 episode 的第一次动作聚合（没有历史执行动作，所以逻辑会特殊处理）
         self._agg_action_buffer: Optional[torch.Tensor] = None
         self._agg_weight_buffer: Optional[torch.Tensor] = None
@@ -595,6 +608,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         image_pair = raw_batch['image'] if 'image' in raw_batch else None
         doser_image_pair = raw_batch['doser_image_pair'] if 'doser_image_pair' in raw_batch else None
         qpos_pair = raw_batch['qpos'] if 'qpos' in raw_batch else None  ## (B, 2时间, 9=7jiont+2爪宽)
+        doser_qpos_pair = raw_batch['doser_qpos_pair'] if 'doser_qpos_pair' in raw_batch else None
         
         if 'd3p_subgoal_pair' in raw_batch:
             subgoal_pair = self.normalizer.normalize({'subgoal': raw_batch['d3p_subgoal_pair']}, self.subgoal_dim_nocont)['subgoal']
@@ -669,6 +683,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             'image_pair': image_pair,
             'doser_image_pair': doser_image_pair,
             'qpos_pair': qpos_pair,
+            'doser_qpos_pair': doser_qpos_pair,
 
             'd3p_action_pair': d3p_action_pair,
             'act_is_pad_pair': act_is_pad_pair,
@@ -1144,8 +1159,13 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         aligned_A_norm = self._extract_action_segment(action_A_norm, start_A, self.horizon,)
         aligned_B_norm = self._extract_action_segment(action_B_norm, start_B, self.horizon,)
 
-        if self.branch_selector == 'doser':
-            selector_out = self.doser_selector.select(
+        if self.branch_selector in ('doser', 'doser_gt'):
+            active_selector = (
+                self.doser_selector
+                if self.branch_selector == 'doser'
+                else self.doser_gt_selector
+            )
+            selector_out = active_selector.select(
                 common=common,
                 aligned_A_norm=aligned_A_norm,
                 aligned_B_norm=aligned_B_norm,
@@ -1291,8 +1311,10 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         aligned_A_norm: torch.Tensor,
         aligned_B_norm: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        if self.branch_selector == 'doser':
-            raise RuntimeError("branch_selector='doser' should call DoserBranchSelector.select().")
+        if self.branch_selector in ('doser', 'doser_gt'):
+            raise RuntimeError(
+                f"branch_selector='{self.branch_selector}' should call its DOSER selector."
+            )
         if self.branch_selector == 'err':
             select_B = (err_B < err_A)
             select_score_A = -err_A

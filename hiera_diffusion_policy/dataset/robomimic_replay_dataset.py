@@ -265,8 +265,15 @@ class RobomimicReplayDataset(BasePcdDataset):
             seq['qpos_state'][current_seq_idx],
             seq['qpos_state'][target_seq_idx],
         ], axis=0).astype(np.float32)
+        doser_qpos_pair = np.stack([
+            seq['qpos_state'][current_seq_idx],
+            seq['next_qpos_state'][current_seq_idx],
+        ], axis=0).astype(np.float32)
         if self.qpos_normalize and (self.qpos_mean is not None):            ##标准化
             qpos = (qpos - self.qpos_mean[None, :]) / self.qpos_std[None, :]
+            doser_qpos_pair = (
+                doser_qpos_pair - self.qpos_mean[None, :]
+            ) / self.qpos_std[None, :]
 
         d3p_subgoal_pair = np.stack([
             seq['subgoal'][current_seq_idx],
@@ -301,6 +308,7 @@ class RobomimicReplayDataset(BasePcdDataset):
             'image': image,                     # (2, 2, C, H, W)
             'doser_image_pair': doser_image_pair, # (2, 2, C, H, W), aligned to t and t+Tr
             'qpos': qpos,                       # (2, 9)
+            'doser_qpos_pair': doser_qpos_pair, # (2, 9), aligned to t and t+Tr
             'd3p_action_pair': d3p_action_pair, # (2, L, 10)
             'act_is_pad_pair': act_is_pad_pair, # (2, L)
             'd3p_subgoal_pair': d3p_subgoal_pair, # (2, subgoal_dim)
@@ -446,6 +454,7 @@ def _data_to_obs(raw_obs, obj_pcd, scene_pcd, raw_actions, obs_keys, abs_action,
             'front_image': np.asarray(raw_obs[front_key][curr_slice]),
             'wrist_image': np.asarray(raw_obs[wrist_key][curr_slice]),
             'qpos_state': qpos[curr_slice],
+            'next_qpos_state': qpos[next_slice],
         })
 
     return data

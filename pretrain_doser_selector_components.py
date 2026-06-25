@@ -156,22 +156,26 @@ def _load_model_prefixes(
     if not matched:
         raise RuntimeError(f"No matching parameters loaded from {ckpt_path} for prefixes={prefixes}.")
 
-    missing_required = [
-        prefix for prefix in required_prefixes
-        if not any(key.startswith(prefix) for key in matched)
-    ]
-    if missing_required:
-        raise RuntimeError(
-            f"Checkpoint {ckpt_path} is missing required prefixes: {missing_required}."
-        )
-
-    target.update(matched)
-    model.load_state_dict(target, strict=False)
     complete_prefix = {}
     for prefix in prefixes:
         target_keys = [key for key in target_prefixed_keys if key.startswith(prefix)]
         loaded_keys = [key for key in target_keys if key in matched]
-        complete_prefix[prefix] = len(target_keys) > 0 and len(loaded_keys) == len(target_keys)
+        complete_prefix[prefix] = (
+            len(target_keys) > 0 and len(loaded_keys) == len(target_keys)
+        )
+
+    missing_required = [
+        prefix for prefix in required_prefixes
+        if not complete_prefix.get(prefix, False)
+    ]
+    if missing_required:
+        raise RuntimeError(
+            f"Checkpoint {ckpt_path} did not completely load required prefixes: "
+            f"{missing_required}."
+        )
+
+    target.update(matched)
+    model.load_state_dict(target, strict=False)
     return complete_prefix
 
 
@@ -371,7 +375,7 @@ def _train_action_and_dynamics(
                 image=next_image,
             )   # 下一状态 latent
             dynamics_out = dynamics_model(common, action_eval)
-            dynamics_loss = F.mse_loss(dynamics_out["next_latent"], z_next.detach())
+            dynamics_loss = F.mse_loss(dynamics_out["next_latent"], z_next.detach())    ###### z'
             dynamics_state_loss = F.mse_loss(dynamics_out["next_state"], next_state)    #新增 next_state_head（dynamics_state_loss）
             current_image = common.get("doser_image_pair", None)
             if current_image is None:
@@ -455,11 +459,11 @@ def _train_state_detector_and_value(
                     action_eval.reshape(action_eval.shape[0], -1),
                 )
                 q_target = torch.minimum(q1.squeeze(-1), q2.squeeze(-1))
-            # state_loss #########
+            # state_loss ##########     信息：(z,z')
             state_loss = state_detector.denoising_loss(
                 torch.cat((z_current, z_next), dim=0)
             )
-            # value_loss #########
+            # value_loss #########      信息：（ z,subgoal)
             value_subgoal = common.get("subgoal", None) if int(pre_cfg.value_subgoal_dim) > 0 else None
             value_pred = value_net(z_current, value_subgoal)
             value_loss = value_net.expectile_loss(

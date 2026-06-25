@@ -535,7 +535,7 @@ class TrainWorkspace(BaseWorkspace):
                                 step_log['train_branch_score_B'] = pred_out['branch_score_B'].mean().item()
                             if 'branch_select_source' in pred_out:
                                 branch_select_source = pred_out['branch_select_source']
-                                if cfg.policy.branch_selector == 'doser':
+                                if cfg.policy.branch_selector in ('doser', 'doser_gt'):
                                     step_log['train_branch_select_source_both_action_id_q_ratio'] = (
                                         (branch_select_source == 0).float().mean().item()
                                     )
