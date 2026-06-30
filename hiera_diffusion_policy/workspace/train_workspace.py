@@ -533,6 +533,21 @@ class TrainWorkspace(BaseWorkspace):
                                 step_log['train_branch_score_A'] = pred_out['branch_score_A'].mean().item()
                             if 'branch_score_B' in pred_out:
                                 step_log['train_branch_score_B'] = pred_out['branch_score_B'].mean().item()
+                            doser_log_keys = (
+                                ('doser_action_percentile_A', 'train_doser_action_percentile_A_mean'),
+                                ('doser_action_percentile_B', 'train_doser_action_percentile_B_mean'),
+                                ('doser_action_id_A', 'train_doser_action_id_A_rate'),
+                                ('doser_action_id_B', 'train_doser_action_id_B_rate'),
+                                ('doser_state_percentile_A', 'train_doser_state_percentile_A_mean'),
+                                ('doser_state_percentile_B', 'train_doser_state_percentile_B_mean'),
+                                ('doser_q_A', 'train_doser_q_A_mean'),
+                                ('doser_q_B', 'train_doser_q_B_mean'),
+                                ('doser_v_A', 'train_doser_v_A_mean'),
+                                ('doser_v_B', 'train_doser_v_B_mean'),
+                            )
+                            for pred_key, log_key in doser_log_keys:
+                                if pred_key in pred_out:
+                                    step_log[log_key] = pred_out[pred_key].float().mean().item()
                             if 'branch_select_source' in pred_out:
                                 branch_select_source = pred_out['branch_select_source']
                                 if cfg.policy.branch_selector in ('doser', 'doser_gt'):

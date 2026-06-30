@@ -370,6 +370,19 @@ class RobomimicRunner(BasePcdRunner):
         branch_select_source_0_trace = list()
         branch_select_source_1_trace = list()
         branch_select_source_2_trace = list()
+        doser_trace_keys = (
+            'doser_action_percentile_A',
+            'doser_action_percentile_B',
+            'doser_action_id_A',
+            'doser_action_id_B',
+            'doser_state_percentile_A',
+            'doser_state_percentile_B',
+            'doser_q_A',
+            'doser_q_B',
+            'doser_v_A',
+            'doser_v_B',
+        )
+        doser_traces = {key: list() for key in doser_trace_keys}
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
@@ -502,6 +515,9 @@ class RobomimicRunner(BasePcdRunner):
                     branch_select_source_0_trace.append(float((branch_select_source == 0).mean()))
                     branch_select_source_1_trace.append(float((branch_select_source == 1).mean()))
                     branch_select_source_2_trace.append(float((branch_select_source == 2).mean()))
+                for key in doser_trace_keys:
+                    if key in np_action_dict:
+                        doser_traces[key].append(float(np_action_dict[key].mean()))
 
                 # handle latency_steps, we discard the first n_latency_steps actions
                 # to simulate latency
@@ -600,6 +616,21 @@ class RobomimicRunner(BasePcdRunner):
                 log_data['branch_select_source_err_ratio'] = float(np.mean(branch_select_source_0_trace))
                 log_data['branch_select_source_q_ratio'] = float(np.mean(branch_select_source_1_trace))
                 log_data['branch_select_source_hybrid_linear_ratio'] = float(np.mean(branch_select_source_2_trace))
+        doser_log_names = {
+            'doser_action_percentile_A': 'doser_action_percentile_A_mean',
+            'doser_action_percentile_B': 'doser_action_percentile_B_mean',
+            'doser_action_id_A': 'doser_action_id_A_rate',
+            'doser_action_id_B': 'doser_action_id_B_rate',
+            'doser_state_percentile_A': 'doser_state_percentile_A_mean',
+            'doser_state_percentile_B': 'doser_state_percentile_B_mean',
+            'doser_q_A': 'doser_q_A_mean',
+            'doser_q_B': 'doser_q_B_mean',
+            'doser_v_A': 'doser_v_A_mean',
+            'doser_v_B': 'doser_v_B_mean',
+        }
+        for key, log_name in doser_log_names.items():
+            if len(doser_traces[key]) > 0:
+                log_data[log_name] = float(np.mean(doser_traces[key]))
 
         return log_data
     

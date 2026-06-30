@@ -1208,6 +1208,22 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
                 out['branch_select_source'] = selector_out['select_source'].unsqueeze(-1)
                 # 'hybrid_gate'模式： 0 = 比较 diffusion errors    1 = 比较 critic Q scores
                 # 'doser'模式：0 = A/B action 都 ID，按 Q 选择      1 = 一个 ID 一个 OOD    2 = A/B action 都 OOD，使用 state/value/fallback
+            if self.branch_selector in ('doser', 'doser_gt'):
+                for key in (
+                    'action_percentile_A',
+                    'action_percentile_B',
+                    'action_id_A',
+                    'action_id_B',
+                    'state_percentile_A',
+                    'state_percentile_B',
+                    'q_A',
+                    'q_B',
+                    'v_A',
+                    'v_B',
+                ):
+                    if key in selector_out:
+                        value = selector_out[key]
+                        out[f'doser_{key}'] = value.unsqueeze(-1) if value.ndim == 1 else value
             return out
 
         ## 直接按score选
@@ -1235,6 +1251,22 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             out['branch_select_source'] = selector_out['select_source'].unsqueeze(-1)
                 # 'hybrid_gate'模式： 0 = 比较 diffusion errors    1 = 比较 critic Q scores
                 # 'doser'模式：0 = A/B action 都 ID，按 Q 选择      1 = 一个 ID 一个 OOD    2 = A/B action 都 OOD，使用 state/value/fallback
+        if self.branch_selector in ('doser', 'doser_gt'):
+            for key in (
+                'action_percentile_A',
+                'action_percentile_B',
+                'action_id_A',
+                'action_id_B',
+                'state_percentile_A',
+                'state_percentile_B',
+                'q_A',
+                'q_B',
+                'v_A',
+                'v_B',
+            ):
+                if key in selector_out:
+                    value = selector_out[key]
+                    out[f'doser_{key}'] = value.unsqueeze(-1) if value.ndim == 1 else value
         return out
 
     # =========================
