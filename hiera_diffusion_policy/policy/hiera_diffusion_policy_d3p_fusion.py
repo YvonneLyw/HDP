@@ -685,7 +685,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             'qpos_pair': qpos_pair,
             'doser_qpos_pair': doser_qpos_pair,
 
-            'd3p_action_pair': d3p_action_pair,
+            'd3p_action_pair': d3p_action_pair, # (B, 2时间：[t, t + d3p_query_every=4], d3p_action_chunk_len=16, action_dim)
             'act_is_pad_pair': act_is_pad_pair,
 
             'extra_cond_zero': extra_cond_zero,

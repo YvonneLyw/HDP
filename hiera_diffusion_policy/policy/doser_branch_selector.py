@@ -251,6 +251,28 @@ class DoserBranchSelector(nn.Module):
         return value.reshape(-1)
 
     @torch.no_grad()
+    def _score_action_candidates(
+        self,
+        common: Dict[str, Optional[torch.Tensor]],
+        aA_eval: torch.Tensor,
+        aB_eval: torch.Tensor,
+    ):
+        action_detector = self._require(self.action_detector, "full-state action detector")
+        score_A = self._score_detector(
+            action_detector,
+            self.action_ood_percentile,
+            common,
+            aA_eval,
+        )
+        score_B = self._score_detector(
+            action_detector,
+            self.action_ood_percentile,
+            common,
+            aB_eval,
+        )
+        return score_A, score_B
+
+    @torch.no_grad()
     def select(
         self,
         common: Dict[str, Optional[torch.Tensor]],
@@ -259,23 +281,18 @@ class DoserBranchSelector(nn.Module):
         critic_target,
         Tr: int,
     ) -> Dict[str, torch.Tensor]:
-        action_detector = self._require(self.action_detector, "full-state action detector")
         state_detector = self._require(self.state_detector, "latent state support detector")
 
         aA_eval = aligned_A_norm[:, :int(Tr)]
         aB_eval = aligned_B_norm[:, :int(Tr)]
 
         # 判断 action 是否 ID
-        error_A, p_A, id_A = self._score_detector(
-            action_detector,
-            self.action_ood_percentile,
+        (
+            (error_A, p_A, id_A),
+            (error_B, p_B, id_B),
+        ) = self._score_action_candidates(
             common,
             aA_eval,
-        )
-        error_B, p_B, id_B = self._score_detector(
-            action_detector,
-            self.action_ood_percentile,
-            common,
             aB_eval,
         )
 

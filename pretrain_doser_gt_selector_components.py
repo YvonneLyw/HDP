@@ -74,6 +74,7 @@ DEFAULT_PRETRAIN_CFG = {
     "dynamics_image_feat_dim": 64,
     "dynamics_pcd_feat_dim": 64,
     "predict_delta": True,
+    "split_action_detectors": False,
     "action_loss_weight": 1.0,
     "dynamics_loss_weight": 1.0,
     "dynamics_state_loss_weight": 0.7,
@@ -109,19 +110,49 @@ def _limit_reached(cfg, step: int, batch_idx: int) -> bool:
 def _build_components(dims: Dict, cfg, device: torch.device):
     if dims["image_shape"] is None:
         raise RuntimeError("Ground-truth DOSER pretraining requires image observations.")
-    action_detector = FullStateActionDetector(
-        state_dim=dims["state_dim"],
-        subgoal_dim=dims["subgoal_dim"],
-        qpos_dim=dims["qpos_dim"],
-        action_eval_dim=dims["action_eval_dim"],
-        pcd_dim=dims["pcd_dim"],
-        image_shape=dims["image_shape"],
-        image_feat_dim=cfg.action_image_feat_dim,
-        pcd_feat_dim=cfg.action_pcd_feat_dim,
-        hidden_dim=cfg.detector_hidden_dim,
-        time_embed_dim=cfg.time_embed_dim,
-        score_samples=cfg.score_samples,
-    ).to(device)
+    if bool(cfg.split_action_detectors):
+        action_detector = torch.nn.ModuleDict({
+            "A": FullStateActionDetector(
+                state_dim=dims["state_dim"],
+                subgoal_dim=dims["subgoal_dim"],
+                qpos_dim=0,
+                action_eval_dim=dims["action_eval_dim"],
+                pcd_dim=dims["pcd_dim"],
+                image_shape=None,
+                image_feat_dim=0,
+                pcd_feat_dim=cfg.action_pcd_feat_dim,
+                hidden_dim=cfg.detector_hidden_dim,
+                time_embed_dim=cfg.time_embed_dim,
+                score_samples=cfg.score_samples,
+            ),
+            "B2": FullStateActionDetector(
+                state_dim=0,
+                subgoal_dim=dims["subgoal_dim"],
+                qpos_dim=dims["qpos_dim"],
+                action_eval_dim=dims["action_eval_dim"],
+                pcd_dim=0,
+                image_shape=dims["image_shape"],
+                image_feat_dim=cfg.action_image_feat_dim,
+                pcd_feat_dim=0,
+                hidden_dim=cfg.detector_hidden_dim,
+                time_embed_dim=cfg.time_embed_dim,
+                score_samples=cfg.score_samples,
+            ),
+        }).to(device)
+    else:
+        action_detector = FullStateActionDetector(
+            state_dim=dims["state_dim"],
+            subgoal_dim=dims["subgoal_dim"],
+            qpos_dim=dims["qpos_dim"],
+            action_eval_dim=dims["action_eval_dim"],
+            pcd_dim=dims["pcd_dim"],
+            image_shape=dims["image_shape"],
+            image_feat_dim=cfg.action_image_feat_dim,
+            pcd_feat_dim=cfg.action_pcd_feat_dim,
+            hidden_dim=cfg.detector_hidden_dim,
+            time_embed_dim=cfg.time_embed_dim,
+            score_samples=cfg.score_samples,
+        ).to(device)
     dynamics_model = GroundTruthDynamicsModel(
         state_dim=dims["state_dim"],
         subgoal_dim=dims["subgoal_dim"],
@@ -175,6 +206,26 @@ def _prepare_gt_batch(model, batch):
     )
 
 
+def _extract_b_action_eval(model, common):
+    d3p_action_pair = common.get("d3p_action_pair", None)
+    if d3p_action_pair is None:
+        raise RuntimeError("Split B2 action detector requires common['d3p_action_pair'].")
+    return model._extract_action_segment(
+        d3p_action_pair[:, 0],
+        0,
+        model.Tr,
+    )
+
+
+def _action_denoising_loss(model, common, action_eval, action_detector, cfg):
+    if not bool(cfg.split_action_detectors):
+        return action_detector.denoising_loss(common, action_eval)
+    action_B_eval = _extract_b_action_eval(model, common)   #   (B, Tr=8, 10)
+    loss_A = action_detector["A"].denoising_loss(common, action_eval)
+    loss_B = action_detector["B2"].denoising_loss(common, action_B_eval)
+    return 0.5 * (loss_A + loss_B)
+
+
 def _train_components(model, loader, components, cfg, device):
     action_detector, dynamics_model, state_detector, value_net = components
     _set_trainable(action_detector, True)
@@ -215,7 +266,13 @@ def _train_components(model, loader, components, cfg, device):
                 _,
             ) = _prepare_gt_batch(model, batch)
             # action_loss ###########
-            action_loss = action_detector.denoising_loss(common, action_eval)
+            action_loss = _action_denoising_loss(
+                model,
+                common,
+                action_eval,
+                action_detector,
+                cfg,
+            )
             # dynamics_loss ###########
             dynamics_out = dynamics_model(common, action_eval)
             dynamics_state_loss = F.mse_loss(
@@ -276,7 +333,8 @@ def _calibrate(model, loader, components, cfg, device):
     action_detector, _, state_detector, _ = components
     for module in components:
         module.eval()
-    action_errors = []
+    split_action_detectors = bool(cfg.split_action_detectors)
+    action_errors = {"A": [], "B2": []} if split_action_detectors else []
     state_errors = []
     pbar = tqdm.tqdm(loader, desc="Calibrating DOSER-GT detectors", leave=False)
     for batch_idx, batch in enumerate(pbar):
@@ -295,13 +353,30 @@ def _calibrate(model, loader, components, cfg, device):
             _,
         ) = _prepare_gt_batch(model, batch)
         # 整个校准数据上的 action reference error 分布
-        action_errors.append(
-            action_detector.reconstruction_error(
-                common,
-                action_eval,
-                cfg.score_samples,
-            ).cpu()
-        )
+        if split_action_detectors:
+            action_B_eval = _extract_b_action_eval(model, common)
+            action_errors["A"].append(
+                action_detector["A"].reconstruction_error(
+                    common,
+                    action_eval,
+                    cfg.score_samples,
+                ).cpu()
+            )
+            action_errors["B2"].append(
+                action_detector["B2"].reconstruction_error(
+                    common,
+                    action_B_eval,
+                    cfg.score_samples,
+                ).cpu()
+            )
+        else:
+            action_errors.append(
+                action_detector.reconstruction_error(
+                    common,
+                    action_eval,
+                    cfg.score_samples,
+                ).cpu()
+            )
         # Reference errors over true [state, qpos] successors.
         state_errors.append(
             state_detector.reconstruction_error(
@@ -309,10 +384,20 @@ def _calibrate(model, loader, components, cfg, device):
                 cfg.score_samples,
             ).cpu()
         )
-    action_errors = torch.cat(action_errors)
+    if split_action_detectors:
+        action_errors = {
+            "A": torch.cat(action_errors["A"]),
+            "B2": torch.cat(action_errors["B2"]),
+        }
+    else:
+        action_errors = torch.cat(action_errors)
     state_errors = torch.cat(state_errors)
     # action/state_errorserror 拉平、排序、存到 detector 自己的 buffer 里。
-    action_detector.set_reference_errors(action_errors)
+    if split_action_detectors:
+        action_detector["A"].set_reference_errors(action_errors["A"])
+        action_detector["B2"].set_reference_errors(action_errors["B2"])
+    else:
+        action_detector.set_reference_errors(action_errors)
     state_detector.set_reference_errors(state_errors)
     return action_errors, state_errors
 
@@ -439,11 +524,18 @@ def _validate(model, loader, components, cfg, device, state_percentile):
 def _save(cfg, pre_cfg, dims, components, reference_errors, metrics):
     action_detector, dynamics_model, state_detector, value_net = components
     demo_count = _resolve_pretrain_demo_count(cfg, pre_cfg)
+    split_action_detectors = bool(pre_cfg.split_action_detectors)
     # 创建输出目录
     output_dir = pathlib.Path(str(pre_cfg.output_dir))
     output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_name = str(pre_cfg.checkpoint_name)
+    if (
+        split_action_detectors
+        and checkpoint_name == str(DEFAULT_PRETRAIN_CFG["checkpoint_name"])
+    ):
+        checkpoint_name = "doser_selector_components_gt_split.ckpt"
     output_path = output_dir / _checkpoint_name_with_demo_count(
-        pre_cfg.checkpoint_name,
+        checkpoint_name,
         demo_count,
     )
 
@@ -472,18 +564,25 @@ def _save(cfg, pre_cfg, dims, components, reference_errors, metrics):
         "predict_delta": bool(pre_cfg.predict_delta),
         "value_subgoal_dim": int(value_net.subgoal_dim),
         "max_train_episodes": demo_count,
+        "action_detector_mode": "branch" if split_action_detectors else "shared",
     }
+
+    state_dicts = {
+        "dynamics_model": cpu_state_dict(dynamics_model),
+        "state_detector": cpu_state_dict(state_detector),
+        "value_net": cpu_state_dict(value_net),
+    }
+    if split_action_detectors:
+        state_dicts["action_detector_A"] = cpu_state_dict(action_detector["A"])
+        state_dicts["action_detector_B2"] = cpu_state_dict(action_detector["B2"])
+    else:
+        state_dicts["action_detector"] = cpu_state_dict(action_detector)
 
     payload = {
         "cfg": OmegaConf.to_container(cfg, resolve=True),
         "doser_gt_pretrain_cfg": OmegaConf.to_container(pre_cfg, resolve=True),
         "metadata": metadata,
-        "state_dicts": {
-            "action_detector": cpu_state_dict(action_detector),
-            "dynamics_model": cpu_state_dict(dynamics_model),
-            "state_detector": cpu_state_dict(state_detector),
-            "value_net": cpu_state_dict(value_net),
-        },
+        "state_dicts": state_dicts,
         "reference_errors": {
             "action": reference_errors[0],  # 未排序
             "state": reference_errors[1],   # 未排序
