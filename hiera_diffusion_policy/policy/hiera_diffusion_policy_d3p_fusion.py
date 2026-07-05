@@ -69,6 +69,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         image_size=(84, 84),
         doser_selector: Optional[Dict] = None,
         doser_gt_selector: Optional[Dict] = None,
+        doser_critic_refresh: Optional[Dict] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -178,6 +179,24 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         self.doser_gt_selector = GroundTruthDoserBranchSelector(
             **doser_gt_selector_cfg
         )
+        self.doser_critic_refresh_cfg = {
+            'enabled': False,
+            'start_epoch': 100,
+            'every': 100,
+            'max_batches': None,
+            'bellman_weight': 1.0,
+            'low_weight': 0.1,
+            'rank_weight': 0.1,
+            'q_low': 0.0,
+            'rank_margin': 0.05,
+            'value_sync_enabled': True,
+            'value_sync_weight': 1.0,
+            'value_lr': 1.0e-4,
+            'value_weight_decay': 1.0e-6,
+            'value_expectile': 0.7,
+        }
+        self.doser_critic_refresh_cfg.update(dict(doser_critic_refresh or {}))
+        self._doser_value_optimizer = None
         self._smoothing_prev_exec_norm: Optional[torch.Tensor] = None   ## 上一次最终执行的动作序列，用于判断这是不是当前 episode 的第一次动作聚合（没有历史执行动作，所以逻辑会特殊处理）
         self._agg_action_buffer: Optional[torch.Tensor] = None
         self._agg_weight_buffer: Optional[torch.Tensor] = None
@@ -192,6 +211,320 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         if self.dko is not None:
             params += list(self.dko.parameters())
         return params
+
+    def should_run_doser_critic_refresh(self, epoch_actor: int) -> bool:
+        cfg = self.doser_critic_refresh_cfg
+        if not bool(cfg.get('enabled', False)):
+            return False
+        if self.branch_selector != 'doser_gt':
+            return False
+        start_epoch = int(cfg.get('start_epoch', 100))
+        every = int(cfg.get('every', 100))
+        epoch_actor = int(epoch_actor)
+        return every > 0 and epoch_actor >= start_epoch and (epoch_actor % every) == 0
+
+    def get_doser_critic_refresh_max_batches(self):
+        max_batches = self.doser_critic_refresh_cfg.get('max_batches', None)
+        return None if max_batches is None else int(max_batches)
+
+    def begin_doser_critic_refresh(self) -> None:
+        selector = self._get_doser_gt_refresh_selector()
+        self.actor.eval()
+        self.actor_target.eval()
+        self.branch_condition_encoder.eval()
+        if self.dko is not None:
+            self.dko.eval()
+        self.critic.train()
+        self.critic.requires_grad_(True)
+        self.critic_target.eval()
+        for module in (
+            selector.action_detector,
+            getattr(selector, 'action_detector_A', None),
+            getattr(selector, 'action_detector_B2', None),
+            selector.dynamics_model,
+            selector.state_detector,
+        ):
+            if module is not None:
+                module.eval()
+                module.requires_grad_(False)
+        if bool(self.doser_critic_refresh_cfg.get('value_sync_enabled', True)):
+            selector.value_net.train()
+            selector.value_net.requires_grad_(True)
+
+    def end_doser_critic_refresh(self) -> None:
+        selector = self._get_doser_gt_refresh_selector()
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.critic.train()
+        self.critic_target.eval()
+        selector.value_net.eval()
+        selector.value_net.requires_grad_(False)
+        self.actor.train()
+        self.branch_condition_encoder.train()
+        if self.dko is not None:
+            self.dko.train()
+
+    def _get_doser_gt_refresh_selector(self) -> GroundTruthDoserBranchSelector:
+        if self.branch_selector != 'doser_gt':
+            raise RuntimeError("DOSER critic refresh currently requires branch_selector='doser_gt'.")
+        selector = self.doser_gt_selector
+        selector._require(selector.dynamics_model, "ground-truth state dynamics model")
+        selector._require(selector.state_detector, "ground-truth state support detector")
+        selector._require(selector.value_net, "ground-truth value net")
+        if getattr(selector, "use_branch_action_detectors", False):
+            selector._require(getattr(selector, "action_detector_A", None), "branch-A action detector")
+            selector._require(getattr(selector, "action_detector_B2", None), "branch-B2 action detector")
+        else:
+            selector._require(selector.action_detector, "full-state action detector")
+        return selector
+
+    def _get_doser_value_optimizer(self):
+        if self._doser_value_optimizer is None:
+            selector = self._get_doser_gt_refresh_selector()
+            self._doser_value_optimizer = torch.optim.AdamW(
+                selector.value_net.parameters(),
+                lr=float(self.doser_critic_refresh_cfg.get('value_lr', 1.0e-4)),
+                weight_decay=float(self.doser_critic_refresh_cfg.get('value_weight_decay', 1.0e-6)),
+            )
+        return self._doser_value_optimizer
+
+    def _doser_masked_mean(self, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        values = values.reshape(-1)
+        mask = mask.reshape(-1).to(device=values.device, dtype=values.dtype)
+        return (values * mask).sum() / mask.sum().clamp_min(1.0)
+
+    def _doser_current_successor(self, common: Dict[str, Optional[torch.Tensor]]) -> torch.Tensor:
+        qpos_pair = common.get('doser_qpos_pair', None)
+        if qpos_pair is None:
+            qpos_pair = common.get('qpos_pair', None)
+        if qpos_pair is None:
+            raise RuntimeError("DOSER critic refresh requires qpos_pair or doser_qpos_pair.")
+        qpos = qpos_pair[:, 0] if qpos_pair.dim() == 3 else qpos_pair
+        return torch.cat((common['state'], qpos.to(common['state'])), dim=-1)
+
+    @torch.no_grad()
+    def _sample_doser_refresh_candidates(
+        self,
+        common: Dict[str, Optional[torch.Tensor]],
+    ) -> Dict[str, torch.Tensor]:
+        if self.b_branch != 'B2':
+            raise RuntimeError("DOSER critic refresh currently expects b_branch='B2'.")
+        cond_A = self._build_cond_by_branch('A', common)
+        cond_A_run = self._rollout_cond_from_branch_cond(cond_A)
+        action_A_norm = self.conditional_sample_action(cond=cond_A_run, model=None)
+
+        cond_B = self._build_cond_by_branch('B2', common)
+        cond_B_run = self._rollout_cond_from_branch_cond(cond_B)
+        action_B_norm = self.conditional_sample_action(cond=cond_B_run, model=None)
+
+        aligned_A_norm = self._extract_action_segment(
+            action_A_norm,
+            self._get_action_start('A'),
+            self.horizon,
+        )
+        aligned_B_norm = self._extract_action_segment(
+            action_B_norm,
+            self._get_action_start('B2'),
+            self.horizon,
+        )
+        return {
+            'aA_eval': aligned_A_norm[:, :self.Tr].detach(),
+            'aB_eval': aligned_B_norm[:, :self.Tr].detach(),
+        }
+
+    @torch.no_grad()
+    def _prepare_doser_refresh_data(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        selector = self._get_doser_gt_refresh_selector()
+        common = self._prepare_branch_inputs(batch)
+        action_eval = self._extract_action_segment(
+            common['nbatch']['action'],
+            self._get_action_start('A'),
+            self.Tr,
+        ).detach()
+        candidates = self._sample_doser_refresh_candidates(common)
+        aA_eval = candidates['aA_eval']
+        aB_eval = candidates['aB_eval']
+
+        (
+            (_, _, action_id_A),
+            (_, _, action_id_B),
+        ) = selector._score_action_candidates(common, aA_eval, aB_eval)
+
+        zA_next, dyn_unc_A = selector._predict_latent_transition(common, aA_eval)
+        zB_next, dyn_unc_B = selector._predict_latent_transition(common, aB_eval)
+        _, _, state_id_A = selector._score_detector(
+            selector.state_detector,
+            selector.state_ood_percentile,
+            zA_next,
+        )
+        _, _, state_id_B = selector._score_detector(
+            selector.state_detector,
+            selector.state_ood_percentile,
+            zB_next,
+        )
+        dyn_ok_A = dyn_unc_A <= selector.dynamics_uncertainty_threshold
+        dyn_ok_B = dyn_unc_B <= selector.dynamics_uncertainty_threshold
+        if not selector.require_dynamics_uncertainty:
+            dyn_ok_A = torch.ones_like(state_id_A, dtype=torch.bool)
+            dyn_ok_B = torch.ones_like(state_id_B, dtype=torch.bool)
+
+        value_subgoal = common['subgoal'] if selector.value_net.subgoal_dim > 0 else None
+        v_A = selector.value_net(zA_next, value_subgoal).reshape(-1)
+        v_B = selector.value_net(zB_next, value_subgoal).reshape(-1)
+
+        trusted_A = action_id_A & state_id_A & dyn_ok_A
+        trusted_B = action_id_B & state_id_B & dyn_ok_B
+        value_margin = float(selector.v_margin)
+        bad_A = (~action_id_A) & ((~state_id_A) | (trusted_B & (v_A < (v_B - value_margin))))
+        bad_B = (~action_id_B) & ((~state_id_B) | (trusted_A & (v_B < (v_A - value_margin))))
+        rank_A = trusted_A & (~trusted_B)
+        rank_B = trusted_B & (~trusted_A)
+
+        return {
+            'common': common,
+            'action_eval': action_eval,
+            'current_successor': self._doser_current_successor(common).detach(),
+            'aA_eval': aA_eval,
+            'aB_eval': aB_eval,
+            'zA_next': zA_next.detach(),
+            'zB_next': zB_next.detach(),
+            'bad_A': bad_A.detach(),
+            'bad_B': bad_B.detach(),
+            'rank_A': rank_A.detach(),
+            'rank_B': rank_B.detach(),
+            'trusted_A': trusted_A.detach(),
+            'trusted_B': trusted_B.detach(),
+            'action_id_A': action_id_A.detach(),
+            'action_id_B': action_id_B.detach(),
+            'state_id_A': state_id_A.detach(),
+            'state_id_B': state_id_B.detach(),
+        }
+
+    def _compute_doser_critic_regularization(self, data: Dict[str, torch.Tensor]):
+        common = data['common']
+        B = data['aA_eval'].shape[0]
+        q1_A, q2_A = self.critic(
+            common['pcd'],
+            common['state'],
+            common['subgoal'],
+            data['aA_eval'].reshape(B, -1),
+        )
+        q1_B, q2_B = self.critic(
+            common['pcd'],
+            common['state'],
+            common['subgoal'],
+            data['aB_eval'].reshape(B, -1),
+        )
+        q_A = torch.minimum(q1_A.squeeze(-1), q2_A.squeeze(-1))
+        q_B = torch.minimum(q1_B.squeeze(-1), q2_B.squeeze(-1))
+        q_low = float(self.doser_critic_refresh_cfg.get('q_low', 0.0))
+        q_pair_A = torch.cat((q1_A, q2_A), dim=-1)
+        q_pair_B = torch.cat((q1_B, q2_B), dim=-1)
+        low_A = self._doser_masked_mean(
+            (q_pair_A - q_low).pow(2).mean(dim=-1),
+            data['bad_A'],
+        )
+        low_B = self._doser_masked_mean(
+            (q_pair_B - q_low).pow(2).mean(dim=-1),
+            data['bad_B'],
+        )
+        low_loss = 0.5 * (low_A + low_B)
+
+        rank_margin = float(self.doser_critic_refresh_cfg.get('rank_margin', 0.05))
+        rank_A_loss = self._doser_masked_mean(
+            F.relu(rank_margin - (q_A - q_B)),
+            data['rank_A'],
+        )
+        rank_B_loss = self._doser_masked_mean(
+            F.relu(rank_margin - (q_B - q_A)),
+            data['rank_B'],
+        )
+        rank_loss = 0.5 * (rank_A_loss + rank_B_loss)
+        return low_loss, rank_loss, q_A.detach(), q_B.detach()
+
+    def _sync_doser_refresh_value_net(self, data: Dict[str, torch.Tensor]) -> torch.Tensor:
+        if not bool(self.doser_critic_refresh_cfg.get('value_sync_enabled', True)):
+            return torch.zeros((), device=self.device)
+        selector = self._get_doser_gt_refresh_selector()
+        value_net = selector.value_net
+        optimizer = self._get_doser_value_optimizer()
+        common = data['common']
+        B = data['action_eval'].shape[0]
+        with torch.no_grad():
+            q1_data, q2_data = self.critic(
+                common['pcd'],
+                common['state'],
+                common['subgoal'],
+                data['action_eval'].reshape(B, -1),
+            )
+            q1_A, q2_A = self.critic(
+                common['pcd'],
+                common['state'],
+                common['subgoal'],
+                data['aA_eval'].reshape(B, -1),
+            )
+            q1_B, q2_B = self.critic(
+                common['pcd'],
+                common['state'],
+                common['subgoal'],
+                data['aB_eval'].reshape(B, -1),
+            )
+            target = torch.cat(
+                (
+                    torch.minimum(q1_data.squeeze(-1), q2_data.squeeze(-1)),
+                    torch.minimum(q1_A.squeeze(-1), q2_A.squeeze(-1)),
+                    torch.minimum(q1_B.squeeze(-1), q2_B.squeeze(-1)),
+                ),
+                dim=0,
+            )
+
+        successor = torch.cat(
+            (data['current_successor'], data['zA_next'], data['zB_next']),
+            dim=0,
+        )
+        value_subgoal = None
+        if value_net.subgoal_dim > 0:
+            value_subgoal = common['subgoal'].repeat(3, 1)
+        value_pred = value_net(successor, value_subgoal)
+        value_loss = value_net.expectile_loss(
+            target - value_pred,
+            float(self.doser_critic_refresh_cfg.get('value_expectile', 0.7)),
+        )
+        value_loss = float(self.doser_critic_refresh_cfg.get('value_sync_weight', 1.0)) * value_loss
+        optimizer.zero_grad(set_to_none=True)
+        value_loss.backward()
+        optimizer.step()
+        return value_loss.detach()
+
+    def doser_critic_refresh_step(self, batch: Dict[str, torch.Tensor], optimizer_critic) -> Dict[str, float]:
+        data = self._prepare_doser_refresh_data(batch)
+        bellman_loss = super().compute_loss_critic(batch)
+        low_loss, rank_loss, q_A, q_B = self._compute_doser_critic_regularization(data)
+        total_loss = (
+            float(self.doser_critic_refresh_cfg.get('bellman_weight', 1.0)) * bellman_loss
+            + float(self.doser_critic_refresh_cfg.get('low_weight', 0.1)) * low_loss
+            + float(self.doser_critic_refresh_cfg.get('rank_weight', 0.1)) * rank_loss
+        )
+        optimizer_critic.zero_grad(set_to_none=True)
+        total_loss.backward()
+        optimizer_critic.step()
+        value_loss = self._sync_doser_refresh_value_net(data)
+        return {
+            'critic_refresh_loss': float(total_loss.detach().item()),
+            'critic_refresh_bellman_loss': float(bellman_loss.detach().item()),
+            'critic_refresh_low_loss': float(low_loss.detach().item()),
+            'critic_refresh_rank_loss': float(rank_loss.detach().item()),
+            'critic_refresh_value_loss': float(value_loss.detach().item()),
+            'critic_refresh_bad_A_rate': float(data['bad_A'].float().mean().item()),
+            'critic_refresh_bad_B_rate': float(data['bad_B'].float().mean().item()),
+            'critic_refresh_trusted_A_rate': float(data['trusted_A'].float().mean().item()),
+            'critic_refresh_trusted_B_rate': float(data['trusted_B'].float().mean().item()),
+            'critic_refresh_action_id_A_rate': float(data['action_id_A'].float().mean().item()),
+            'critic_refresh_action_id_B_rate': float(data['action_id_B'].float().mean().item()),
+            'critic_refresh_state_id_A_rate': float(data['state_id_A'].float().mean().item()),
+            'critic_refresh_state_id_B_rate': float(data['state_id_B'].float().mean().item()),
+            'critic_refresh_q_A_mean': float(q_A.mean().item()),
+            'critic_refresh_q_B_mean': float(q_B.mean().item()),
+        }
 
     def reset(self):
         super().reset()

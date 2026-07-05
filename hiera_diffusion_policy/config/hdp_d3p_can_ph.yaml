@@ -187,6 +187,21 @@ policy:
     fallback_when_both_ood: A
     require_dynamics_uncertainty: false
     dynamics_uncertainty_threshold: 1000000000.0
+  doser_critic_refresh:
+    enabled: true
+    start_epoch: 100
+    every: 100
+    max_batches: null     # null = one full train_loader epoch
+    bellman_weight: 1.0
+    low_weight: 0.1
+    rank_weight: 0.1
+    q_low: 0.0
+    rank_margin: 0.05
+    value_sync_enabled: true
+    value_sync_weight: 1.0
+    value_lr: 0.0001
+    value_weight_decay: 0.000001
+    value_expectile: 0.7
   d3p_rollout_error_samples: 10
   use_koopman_aux: true  # B分支是否叠加DKO辅助loss（koop_consis_kvp / koop_consis_fea）
   extra_cond_dim: ${extra_cond_dim}  

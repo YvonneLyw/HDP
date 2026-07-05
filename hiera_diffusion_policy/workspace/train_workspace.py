@@ -479,6 +479,50 @@ class TrainWorkspace(BaseWorkspace):
                     #                     pred_next_action = self.model.predict_next_action(batch)  # (B, T, A)
                     #                     pred_next_actions.append(pred_next_action)
                     #             next_actions = torch.concat(pred_next_actions, dim=0)
+                    
+                    # ************ 更新 critic （selective regularization） ************
+                    # Optional DOSER-style critic refresh before rollout. This is kept
+                    # outside rollout so evaluation does not update model state.
+                    if (
+                        hasattr(self.model, 'should_run_doser_critic_refresh')
+                        and self.model.should_run_doser_critic_refresh(self.epoch_actor)
+                    ):
+                        refresh_logs = list()
+                        max_refresh_batches = self.model.get_doser_critic_refresh_max_batches()
+                        self.model.begin_doser_critic_refresh()
+                        try:
+                            with tqdm.tqdm(
+                                train_dataloader,
+                                desc=f"DOSER Critic Refresh - epoch {self.epoch_actor}",
+                                leave=False,
+                                mininterval=cfg.training.tqdm_interval_sec,
+                            ) as refresh_epoch:
+                                for refresh_batch_idx, refresh_batch in enumerate(refresh_epoch):
+                                    if (
+                                        max_refresh_batches is not None
+                                        and refresh_batch_idx >= max_refresh_batches
+                                    ):
+                                        break
+                                    refresh_batch = dict_apply(
+                                        refresh_batch,
+                                        lambda x: x.to(device, non_blocking=True),
+                                    )
+                                    refresh_log = self.model.doser_critic_refresh_step(
+                                        refresh_batch,
+                                        self.optimizer_critic,
+                                    )
+                                    refresh_logs.append(refresh_log)
+                                    refresh_epoch.set_postfix(
+                                        loss=refresh_log['critic_refresh_loss'],
+                                        refresh=False,
+                                    )
+                        finally:
+                            self.model.end_doser_critic_refresh()
+
+                        if len(refresh_logs) > 0:
+                            for key in refresh_logs[0].keys():
+                                step_log[key] = float(np.mean([log[key] for log in refresh_logs]))
+                            step_log['critic_refresh_batches'] = len(refresh_logs)
 
                     # run rollout
                     # ************ 在仿真环境中测试 ************
