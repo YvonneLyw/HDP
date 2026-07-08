@@ -13,8 +13,8 @@ from hiera_diffusion_policy.common.robomimic_util import RobomimicAbsoluteAction
 
 
 def main():
-    input_path = pathlib.Path("data/robomimic/datasets/can/ph/image.hdf5")
-    output_path = pathlib.Path("data/robomimic/datasets/can/ph/image_abs.hdf5")
+    input_path = pathlib.Path("data/robomimic/datasets/can/mh/image.hdf5")
+    output_path = pathlib.Path("data/robomimic/datasets/can/mh/image_abs.hdf5")
 
     assert input_path.is_file(), f"Input file not found: {input_path}"
     assert output_path.parent.is_dir(), f"Output dir not found: {output_path.parent}"

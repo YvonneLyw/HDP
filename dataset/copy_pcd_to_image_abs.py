@@ -11,9 +11,9 @@ from tqdm import tqdm
 
 
 def main():
-    src_pcd_path = pathlib.Path("data/robomimic/datasets/can/ph/low_dim_abs_pcd.hdf5")
-    src_img_abs_path = pathlib.Path("data/robomimic/datasets/can/ph/image_abs.hdf5")
-    dst_path = pathlib.Path("data/robomimic/datasets/can/ph/image_abs_pcd.hdf5")
+    src_pcd_path = pathlib.Path("data/robomimic/datasets/can/mh/low_dim_abs_pcd.hdf5")
+    src_img_abs_path = pathlib.Path("data/robomimic/datasets/can/mh/image_abs.hdf5")
+    dst_path = pathlib.Path("data/robomimic/datasets/can/mh/image_abs_pcd.hdf5")
 
     assert src_pcd_path.is_file(), f"PCD source not found: {src_pcd_path}"
     assert src_img_abs_path.is_file(), f"Image abs source not found: {src_img_abs_path}"
