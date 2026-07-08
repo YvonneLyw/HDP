@@ -58,7 +58,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         fusion_debug_checks: bool = True,
         use_koopman_aux: bool = False,
         b_branch_use_q_loss: bool = False,
-        branch_selector: str = 'err',   ##['err','q','hybrid_gate','hybrid_linear','doser_latent','doser_gt']
+        branch_selector: str = 'err',   ##['err','q','hybrid_gate','hybrid_linear','doser_latent','doser_gt','doser_err']
         use_action_smoothing: bool = False,
         use_test_time_aggregation: bool = False,
         test_time_agg_beta: float = 0.97,
@@ -108,10 +108,18 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             raise ValueError(f"d3p_query_every is fixed to 4 in current fusion stage, got {self.d3p_query_every}")
         if self.d3p_rollout_error_samples < 1:
             raise ValueError(f"d3p_rollout_error_samples must be >= 1, got {self.d3p_rollout_error_samples}")
-        if self.branch_selector not in ('err', 'q', 'hybrid_gate', 'hybrid_linear', 'doser_latent', 'doser_gt'):
+        if self.branch_selector not in (
+            'err',
+            'q',
+            'hybrid_gate',
+            'hybrid_linear',
+            'doser_latent',
+            'doser_gt',
+            'doser_err',
+        ):
             raise ValueError(
                 "branch_selector must be one of "
-                "['err','q','hybrid_gate','hybrid_linear','doser_latent','doser_gt'], "
+                "['err','q','hybrid_gate','hybrid_linear','doser_latent','doser_gt','doser_err'], "
                 f"got {self.branch_selector}"
             )
         if self.test_time_agg_beta <= 0.0:
@@ -174,7 +182,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             doser_selector_cfg["components_path"] = None
         self.doser_selector = DoserBranchSelector(**doser_selector_cfg)
         doser_gt_selector_cfg = dict(doser_gt_selector or {})
-        if self.branch_selector != 'doser_gt':
+        if self.branch_selector not in ('doser_gt', 'doser_err'):
             doser_gt_selector_cfg["components_path"] = None
         self.doser_gt_selector = GroundTruthDoserBranchSelector(
             **doser_gt_selector_cfg
@@ -1492,19 +1500,28 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         aligned_A_norm = self._extract_action_segment(action_A_norm, start_A, self.horizon,)
         aligned_B_norm = self._extract_action_segment(action_B_norm, start_B, self.horizon,)
 
-        if self.branch_selector in ('doser_latent', 'doser_gt'):
-            active_selector = (
-                self.doser_selector
-                if self.branch_selector == 'doser_latent'
-                else self.doser_gt_selector
-            )
-            selector_out = active_selector.select(
-                common=common,
-                aligned_A_norm=aligned_A_norm,
-                aligned_B_norm=aligned_B_norm,
-                critic_target=self.critic_target,
-                Tr=self.Tr,
-            )
+        if self.branch_selector in ('doser_latent', 'doser_gt', 'doser_err'):
+            if self.branch_selector == 'doser_err':
+                selector_out = self.doser_gt_selector.select_by_action_percentile(
+                    common=common,
+                    aligned_A_norm=aligned_A_norm,
+                    aligned_B_norm=aligned_B_norm,
+                    Tr=self.Tr,
+                    require_branch_detectors=True,
+                )
+            else:
+                active_selector = (
+                    self.doser_selector
+                    if self.branch_selector == 'doser_latent'
+                    else self.doser_gt_selector
+                )
+                selector_out = active_selector.select(
+                    common=common,
+                    aligned_A_norm=aligned_A_norm,
+                    aligned_B_norm=aligned_B_norm,
+                    critic_target=self.critic_target,
+                    Tr=self.Tr,
+                )
         else:
             err_A = self.compute_ddpm_error(cond=cond_A_run, action_norm=action_A_norm)   ## (B,1)
             err_B = self.compute_ddpm_error(cond=cond_B_run, action_norm=action_B_norm)   ## (B,1)
@@ -1541,7 +1558,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
                 out['branch_select_source'] = selector_out['select_source'].unsqueeze(-1)
                 # 'hybrid_gate'模式： 0 = 比较 diffusion errors    1 = 比较 critic Q scores
                 # 'doser_latent'/'doser_gt'模式：0 = A/B action 都 ID，按 Q 选择      1 = 一个 ID 一个 OOD    2 = A/B action 都 OOD，使用 state/value/fallback
-            if self.branch_selector in ('doser_latent', 'doser_gt'):
+                # 'doser_err'模式：0 = 比较 branch action detector percentile
+            if self.branch_selector in ('doser_latent', 'doser_gt', 'doser_err'):
                 for key in (
                     'action_percentile_A',
                     'action_percentile_B',
@@ -1584,7 +1602,8 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
             out['branch_select_source'] = selector_out['select_source'].unsqueeze(-1)
                 # 'hybrid_gate'模式： 0 = 比较 diffusion errors    1 = 比较 critic Q scores
                 # 'doser_latent'/'doser_gt'模式：0 = A/B action 都 ID，按 Q 选择      1 = 一个 ID 一个 OOD    2 = A/B action 都 OOD，使用 state/value/fallback
-        if self.branch_selector in ('doser_latent', 'doser_gt'):
+                # 'doser_err'模式：0 = 比较 branch action detector percentile
+        if self.branch_selector in ('doser_latent', 'doser_gt', 'doser_err'):
             for key in (
                 'action_percentile_A',
                 'action_percentile_B',
@@ -1676,7 +1695,7 @@ class HieraDiffusionPolicyD3PFusion(HieraDiffusionPolicy):
         aligned_A_norm: torch.Tensor,
         aligned_B_norm: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        if self.branch_selector in ('doser_latent', 'doser_gt'):
+        if self.branch_selector in ('doser_latent', 'doser_gt', 'doser_err'):
             raise RuntimeError(
                 f"branch_selector='{self.branch_selector}' should call its DOSER selector."
             )

@@ -162,7 +162,7 @@ policy:
   b_branch: B2            # B1 / B2 (mode=SWITCH 时与A做训练切换和rollout选择)
   switch_prob_b: 0.5      # mode=SWITCH 时训练阶段采样 B 分支概率
   b_branch_use_q_loss: false   # 是否让B分支也参与Q-loss
-  branch_selector: doser_gt    # err / q / hybrid_gate / hybrid_linear / doser_latent / doser_gt
+  branch_selector: doser_gt    # err / q / hybrid_gate / hybrid_linear / doser_latent / doser_gt / doser_err
   use_action_smoothing: false
   use_test_time_aggregation: false  # branch_selector=doser_latent 的第一版建议改成 false
   test_time_agg_beta: 0.97
@@ -178,6 +178,7 @@ policy:
     require_dynamics_uncertainty: false
     dynamics_uncertainty_threshold: 1000000000.0
   # Parallel ground-truth-state version. Enable with branch_selector=doser_gt.
+  # branch_selector=doser_err reuses this checkpoint and compares A/B action detector percentiles only.
   doser_gt_selector:
     components_path: outputs/doser_selector_components/can_mh/doser_selector_components_gt_split_demo50.ckpt
     action_ood_percentile: 0.98

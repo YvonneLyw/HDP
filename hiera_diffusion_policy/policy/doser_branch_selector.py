@@ -272,6 +272,58 @@ class DoserBranchSelector(nn.Module):
         )
         return score_A, score_B
 
+################################## doser_err #################################################
+    @torch.no_grad()
+    def select_by_action_percentile(
+        self,
+        common: Dict[str, Optional[torch.Tensor]],
+        aligned_A_norm: torch.Tensor,
+        aligned_B_norm: torch.Tensor,
+        Tr: int,
+        require_branch_detectors: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Err-style selector using calibrated action detector percentiles.
+
+        Lower percentile means the candidate action has lower reconstruction
+        error relative to that detector's offline calibration distribution.
+        """
+        if require_branch_detectors and not getattr(self, "use_branch_action_detectors", False):
+            raise RuntimeError(
+                "branch_selector='doser_err' requires a DOSER-GT checkpoint "
+                "trained with +doser_gt_pretrain.split_action_detectors=true."
+            )
+
+        aA_eval = aligned_A_norm[:, :int(Tr)]
+        aB_eval = aligned_B_norm[:, :int(Tr)]
+        (
+            (error_A, p_A, id_A),
+            (error_B, p_B, id_B),
+        ) = self._score_action_candidates(
+            common,
+            aA_eval,
+            aB_eval,
+        )
+
+        select_B = p_B < p_A
+        select_score_A = -p_A
+        select_score_B = -p_B
+        select_source = torch.zeros_like(p_A, dtype=torch.long)
+
+        return {
+            "select_B": select_B.view(-1, 1, 1),
+            "select_score_A": select_score_A,
+            "select_score_B": select_score_B,
+            "select_source": select_source,
+            "action_error_A": error_A,
+            "action_error_B": error_B,
+            "action_percentile_A": p_A,
+            "action_percentile_B": p_B,
+            "action_id_A": id_A,
+            "action_id_B": id_B,
+        }
+
+###############################################################################
     @torch.no_grad()
     def select(
         self,
