@@ -608,7 +608,7 @@ class RobomimicRunner(BasePcdRunner):
                 title='Selected Branch B Ratio Trace',
             )
         if len(branch_select_source_0_trace) > 0:
-            if getattr(policy, 'branch_selector', None) in ('doser', 'doser_gt'):
+            if getattr(policy, 'branch_selector', None) in ('doser_latent', 'doser_gt'):
                 log_data['branch_select_source_both_action_id_q_ratio'] = float(np.mean(branch_select_source_0_trace))
                 log_data['branch_select_source_one_action_id_one_ood_ratio'] = float(np.mean(branch_select_source_1_trace))
                 log_data['branch_select_source_both_action_ood_ratio'] = float(np.mean(branch_select_source_2_trace))

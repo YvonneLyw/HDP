@@ -188,7 +188,7 @@ def _instantiate_policy_and_data(cfg: OmegaConf, pre_cfg: OmegaConf, device: tor
     if "doser_selector" in policy_cfg:
         with open_dict(policy_cfg):
             del policy_cfg.doser_selector
-    if "branch_selector" in policy_cfg and str(policy_cfg.branch_selector).lower() == "doser":
+    if "branch_selector" in policy_cfg and str(policy_cfg.branch_selector).lower() == "doser_latent":
         with open_dict(policy_cfg):
             policy_cfg.branch_selector = "err"
     model = hydra.utils.instantiate(

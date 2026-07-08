@@ -36,7 +36,7 @@ logging:
   group: null
   id: null
   mode: online
-  name: can_ph_seed${training.seed}_${name_remark}
+  name: can_mh_seed${training.seed}_${name_remark}
   project: hiera_diffusion_policy
   resume: false
 
@@ -169,7 +169,7 @@ policy:
   test_time_agg_tau: 0.1
   doser_selector:
     # Preferred: checkpoint produced by HDP/pretrain_doser_selector_components.py.
-    components_path: outputs/doser_selector_components/doser_selector_components_pcd_staged_demo50.ckpt
+    components_path: outputs/doser_selector_components/can_mh/doser_selector_components_pcd_staged_demo50.ckpt
     action_ood_percentile: 0.98
     state_ood_percentile: 0.98
     q_margin: 0.05
@@ -179,7 +179,7 @@ policy:
     dynamics_uncertainty_threshold: 1000000000.0
   # Parallel ground-truth-state version. Enable with branch_selector=doser_gt.
   doser_gt_selector:
-    components_path: outputs/doser_selector_components/doser_selector_components_gt_split_demo50.ckpt
+    components_path: outputs/doser_selector_components/can_mh/doser_selector_components_gt_split_demo50.ckpt
     action_ood_percentile: 0.98
     state_ood_percentile: 0.98
     q_margin: 0.05
@@ -256,7 +256,7 @@ task:
     use_subgoal: ${use_subgoal}
     observation_history_num: ${observation_history_num}
     abs_action: true
-    dataset_path: data/robomimic/datasets/can/ph/image_abs_pcd.hdf5 ###############################一直到
+    dataset_path: data/robomimic/datasets/can/mh/image_abs_pcd.hdf5 ###############################一直到
     use_image: ${use_image}
     image_keys:
     - agentview_image
@@ -278,13 +278,13 @@ task:
     rotation_rep: rotation_6d
     seed: 42
     val_ratio: 0.02
-  dataset_path: data/robomimic/datasets/can/ph/image_abs_pcd.hdf5 #########################
-  dataset_type: ph
+  dataset_path: data/robomimic/datasets/can/mh/image_abs_pcd.hdf5 #########################
+  dataset_type: mh
   env_runner:
     _target_: hiera_diffusion_policy.env_runner.robomimic_runner.RobomimicRunner
     abs_action: true
     crf: 22
-    dataset_path: data/robomimic/datasets/can/ph/image_abs_pcd.hdf5 #########################
+    dataset_path: data/robomimic/datasets/can/mh/image_abs_pcd.hdf5 #########################
     fps: 10
     max_steps: 500
     use_subgoal: ${use_subgoal}
