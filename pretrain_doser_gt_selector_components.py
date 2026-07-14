@@ -57,6 +57,7 @@ DEFAULT_PRETRAIN_CFG = {
     "critic_path": None,
     "require_critic_checkpoint": True,
     "max_train_episodes": None,
+    "val_ratio": None,
     "train_epochs": 500,
     "max_train_steps": None,
     "max_batches_per_epoch": None,
@@ -401,29 +402,89 @@ def _calibrate(model, loader, components, cfg, device):
     state_detector.set_reference_errors(state_errors)
     return action_errors, state_errors
 
+def _state_group_indices(state_dim: int, observation_history_num: int) -> Dict[str, list]:
+    state_dim = int(state_dim)
+    history = max(1, int(observation_history_num))
+    if state_dim % history != 0:
+        return {"all": list(range(state_dim))}
+
+    single_state_dim = state_dim // history
+    # Robomimic can state in this code path is:
+    # object(14), eef pos+quat(7), fingertip positions(6), repeated over obs history.
+    if single_state_dim < 27:
+        return {"all": list(range(state_dim))}
+
+    base_groups = {
+        "object": (0, 14),
+        "eef": (14, 21),
+        "finger": (21, 27),
+    }
+    if single_state_dim > 27:
+        base_groups["other"] = (27, single_state_dim)
+
+    groups = {}
+    for name, (start, end) in base_groups.items():
+        indices = []
+        for hist_idx in range(history):
+            offset = hist_idx * single_state_dim
+            indices.extend(range(offset + start, offset + end))
+        groups[name] = indices
+    return groups
+
+
+def _add_state_group_metrics(
+    metrics: Dict[str, torch.Tensor],
+    pred_next_state: torch.Tensor,
+    next_state: torch.Tensor,
+    current_state: torch.Tensor,
+    observation_history_num: int,
+) -> None:
+    groups = _state_group_indices(
+        pred_next_state.shape[-1],
+        observation_history_num,
+    )
+    for name, indices in groups.items():
+        if len(indices) == 0:
+            continue
+        index = torch.as_tensor(
+            indices,
+            device=pred_next_state.device,
+            dtype=torch.long,
+        )
+        pred_group = pred_next_state.index_select(-1, index)
+        next_group = next_state.index_select(-1, index)
+        current_group = current_state.index_select(-1, index)
+        metrics[f"dyn_state_{name}_mse"] = F.mse_loss(pred_group, next_group)
+        metrics[f"dyn_state_{name}_copy_mse"] = F.mse_loss(current_group, next_group)
+
+
 ################## validation #####################
 @torch.no_grad()
-def _validate(model, loader, components, cfg, device, state_percentile):
+def _validate(model, loader, components, cfg, device, state_percentile, split_name="val"):
     _, dynamics_model, state_detector, value_net = components
     for module in components:
         module.eval()
     sums = {
-        "val_dyn_successor_mse": 0.0,
-        "val_dyn_state_mse": 0.0,
-        "val_dyn_qpos_mse": 0.0,
-        "val_dyn_successor_copy_mse": 0.0,
-        "val_dyn_state_copy_mse": 0.0,
-        "val_dyn_qpos_copy_mse": 0.0,
-        "val_state_id_agreement": 0.0,
-        "val_true_state_id_self_agreement": 0.0,
-        "val_pred_state_id_rate": 0.0,
-        "val_true_state_id_rate": 0.0,
-        "val_value_pred_true_next_mae": 0.0,
-        "val_value_current_q_mae": 0.0,
+        "dyn_successor_mse": 0.0,
+        "dyn_state_mse": 0.0,
+        "dyn_qpos_mse": 0.0,
+        "dyn_successor_copy_mse": 0.0,
+        "dyn_state_copy_mse": 0.0,
+        "dyn_qpos_copy_mse": 0.0,
+        "state_id_agreement": 0.0,
+        "true_state_id_self_agreement": 0.0,
+        "pred_state_id_rate": 0.0,
+        "true_state_id_rate": 0.0,
+        "value_pred_true_next_mae": 0.0,
+        "value_current_q_mae": 0.0,
     }
     count = 0
     q_values = []
-    pbar = tqdm.tqdm(loader, desc="Validating DOSER-GT dynamics", leave=False)
+    pbar = tqdm.tqdm(
+        loader,
+        desc=f"Validating DOSER-GT dynamics ({split_name})",
+        leave=False,
+    )
     for batch_idx, batch in enumerate(pbar):
         if cfg.validation_batches is not None and batch_idx >= int(cfg.validation_batches):
             break
@@ -467,33 +528,43 @@ def _validate(model, loader, components, cfg, device, state_percentile):
         q_values.append(q_target.detach().cpu())
 
         metrics = {
-            "val_dyn_successor_mse": F.mse_loss(
+            "dyn_successor_mse": F.mse_loss(
                 pred_successor,
                 next_successor,
             ),
-            "val_dyn_state_mse": F.mse_loss(pred_next_state, next_state),
-            "val_dyn_qpos_mse": F.mse_loss(pred_next_qpos, next_qpos),
-            "val_dyn_successor_copy_mse": F.mse_loss(
+            "dyn_state_mse": F.mse_loss(pred_next_state, next_state),
+            "dyn_qpos_mse": F.mse_loss(pred_next_qpos, next_qpos),
+            "dyn_successor_copy_mse": F.mse_loss(
                 current_successor,
                 next_successor,
             ),
-            "val_dyn_state_copy_mse": F.mse_loss(
+            "dyn_state_copy_mse": F.mse_loss(
                 common["state"],
                 next_state,
             ),
-            "val_dyn_qpos_copy_mse": F.mse_loss(
+            "dyn_qpos_copy_mse": F.mse_loss(
                 current_qpos,
                 next_qpos,
             ),
-            "val_state_id_agreement": (pred_state_id == true_state_id).float().mean(),
-            "val_true_state_id_self_agreement": (
+            "state_id_agreement": (pred_state_id == true_state_id).float().mean(),
+            "true_state_id_self_agreement": (
                 true_state_id == true_state_id_repeat
             ).float().mean(),
-            "val_pred_state_id_rate": pred_state_id.float().mean(),
-            "val_true_state_id_rate": true_state_id.float().mean(),
-            "val_value_pred_true_next_mae": (pred_next_value - true_next_value).abs().mean(),   #V(pred_s') 与 V(true_s') 的差距
-            "val_value_current_q_mae": (current_value - q_target).abs().mean(),
+            "pred_state_id_rate": pred_state_id.float().mean(),
+            "true_state_id_rate": true_state_id.float().mean(),
+            "value_pred_true_next_mae": (pred_next_value - true_next_value).abs().mean(),   #V(pred_s') 与 V(true_s') 的差距
+            "value_current_q_mae": (current_value - q_target).abs().mean(),
         }
+        _add_state_group_metrics(
+            metrics,
+            pred_next_state,
+            next_state,
+            common["state"],
+            getattr(model, "observation_history_num", 1),
+        )
+        for key in metrics.keys():
+            if key not in sums:
+                sums[key] = 0.0
 
         batch_size = int(action_eval.shape[0])
         for key, value in metrics.items():
@@ -501,24 +572,34 @@ def _validate(model, loader, components, cfg, device, state_percentile):
         count += batch_size
 
     if count == 0:
-        raise RuntimeError("DOSER-GT validation produced no samples.")
+        raise RuntimeError(f"DOSER-GT validation produced no samples for split={split_name}.")
     metrics = {key: value / float(count) for key, value in sums.items()}
     q_values = torch.cat(q_values).float()
     metrics.update({
-        "val_q_mean": float(q_values.mean().item()),
-        "val_q_min": float(q_values.min().item()),
-        "val_q_max": float(q_values.max().item()),
+        "q_mean": float(q_values.mean().item()),
+        "q_min": float(q_values.min().item()),
+        "q_max": float(q_values.max().item()),
     })
-    copy_mse = metrics["val_dyn_successor_copy_mse"]
-    metrics["val_dyn_vs_copy_ratio"] = (
-        metrics["val_dyn_successor_mse"] / copy_mse
-        if copy_mse > 0.0
-        else float("inf")
-    )
-    metrics["val_samples"] = float(count)
-    print("DOSER-GT validation metrics:")
-    print(OmegaConf.to_yaml(OmegaConf.create(metrics)))
-    return metrics
+    for key in list(metrics.keys()):
+        if not key.endswith("_copy_mse"):
+            continue
+        base = key[: -len("_copy_mse")]
+        mse_key = f"{base}_mse"
+        if mse_key in metrics:
+            copy_mse = metrics[key]
+            metrics[f"{base}_vs_copy_ratio"] = (
+                metrics[mse_key] / copy_mse
+                if copy_mse > 0.0
+                else float("inf")
+            )
+    metrics["samples"] = float(count)
+    prefixed_metrics = {
+        f"{split_name}_{key}": value
+        for key, value in metrics.items()
+    }
+    print(f"DOSER-GT validation metrics ({split_name}):")
+    print(OmegaConf.to_yaml(OmegaConf.create(prefixed_metrics)))
+    return prefixed_metrics
 
 
 def _save(cfg, pre_cfg, dims, components, reference_errors, metrics):
@@ -650,16 +731,26 @@ def main(cfg):
         pre_cfg,
         device,
     )
-    # validation
+    # validation diagnostics over train/calibration/held-out splits
     selector_cfg = cfg.policy.get("doser_gt_selector", {})
-    metrics = _validate(
-        model,
-        val_loader,
-        components,
-        pre_cfg,
-        device,
-        state_percentile=float(selector_cfg.get("state_ood_percentile", 0.95)),
-    )
+    state_percentile = float(selector_cfg.get("state_ood_percentile", 0.95))
+    metrics = {}
+    for split_name, split_loader in (
+        ("train", train_loader),
+        ("calib", calib_loader),
+        ("val", val_loader),
+    ):
+        metrics.update(
+            _validate(
+                model,
+                split_loader,
+                components,
+                pre_cfg,
+                device,
+                state_percentile=state_percentile,
+                split_name=split_name,
+            )
+        )
 
     output_path = _save(
         cfg,

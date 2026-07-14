@@ -60,6 +60,7 @@ DEFAULT_PRETRAIN_CFG = {
     "stage1_epochs": None,
     "stage2_epochs": None,
     "max_train_episodes": None,
+    "val_ratio": None,
     "max_train_steps": None,
     "max_batches_per_epoch": None,
     "calibration_batches": None,
@@ -202,6 +203,9 @@ def _instantiate_policy_and_data(cfg: OmegaConf, pre_cfg: OmegaConf, device: tor
     if pre_cfg.max_train_episodes is not None:
         with open_dict(dataset_cfg):
             dataset_cfg.max_train_episodes = int(pre_cfg.max_train_episodes)
+    if "val_ratio" in pre_cfg and pre_cfg.val_ratio is not None:
+        with open_dict(dataset_cfg):
+            dataset_cfg.val_ratio = float(pre_cfg.val_ratio)
     dataset = hydra.utils.instantiate(dataset_cfg)
     # 设置 Normalizer                               ##############D3P信息怎么办?
     normalizer = dataset.get_normalizer()

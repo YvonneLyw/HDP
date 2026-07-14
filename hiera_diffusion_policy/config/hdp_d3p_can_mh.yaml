@@ -169,7 +169,7 @@ policy:
   test_time_agg_tau: 0.1
   doser_selector:
     # Preferred: checkpoint produced by HDP/pretrain_doser_selector_components.py.
-    components_path: outputs/doser_selector_components/can_mh/doser_selector_components_pcd_staged_demo50.ckpt
+    components_path: outputs/doser_selector_components/can_mh/doser_selector_components_gt_split_demo300.ckpt
     action_ood_percentile: 0.98
     state_ood_percentile: 0.98
     q_margin: 0.05
@@ -180,7 +180,7 @@ policy:
   # Parallel ground-truth-state version. Enable with branch_selector=doser_gt.
   # branch_selector=doser_err reuses this checkpoint and compares A/B action detector percentiles only.
   doser_gt_selector:
-    components_path: outputs/doser_selector_components/can_mh/doser_selector_components_gt_split_demo50.ckpt
+    components_path: outputs/doser_selector_components/can_mh/doser_selector_components_gt_split_demo300.ckpt
     action_ood_percentile: 0.98
     state_ood_percentile: 0.98
     q_margin: 0.05
