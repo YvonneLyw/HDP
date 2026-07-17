@@ -32,6 +32,8 @@ class GroundTruthDynamicsModel(nn.Module):
         image_shape: Optional[Tuple[int, int, int, int]] = None,
         image_feat_dim: int = 64,
         predict_delta: bool = True,
+        split_heads: bool = False,
+        observation_history_num: int = 1,
     ):
         super().__init__()
         self.state_dim = int(state_dim)
@@ -44,6 +46,8 @@ class GroundTruthDynamicsModel(nn.Module):
         self.pcd_feat_dim = int(pcd_feat_dim) if self.pcd_dim > 0 else 0
         self.image_feat_dim = int(image_feat_dim) if self.image_shape is not None else 0
         self.predict_delta = bool(predict_delta)
+        self.split_heads = bool(split_heads)
+        self.observation_history_num = max(1, int(observation_history_num))
 
         self.pcd_encoder = (
             CurrentPcdEncoder(self.pcd_dim, self.pcd_feat_dim)
@@ -64,13 +68,75 @@ class GroundTruthDynamicsModel(nn.Module):
             + self.image_feat_dim
             + self.action_eval_dim
         )
-        self.transition = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.Mish(),
+        if self.split_heads:
+            (
+                object_indices,
+                eef_finger_indices,
+                other_state_indices,
+            ) = self._build_state_group_indices()
+            self.register_buffer(
+                "object_indices",
+                torch.as_tensor(object_indices, dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "eef_finger_indices",
+                torch.as_tensor(eef_finger_indices, dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "other_state_indices",
+                torch.as_tensor(other_state_indices, dtype=torch.long),
+                persistent=False,
+            )
+            self.transition_trunk = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.Mish(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.Mish(),
+            )
+            self.object_head = self._make_head(hidden_dim, len(object_indices))
+            self.eef_finger_head = self._make_head(hidden_dim, len(eef_finger_indices))
+            self.other_state_head = (
+                self._make_head(hidden_dim, len(other_state_indices))
+                if len(other_state_indices) > 0
+                else None
+            )
+            self.qpos_head = self._make_head(hidden_dim, self.qpos_dim)
+        else:
+            self.transition = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.Mish(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.Mish(),
+                nn.Linear(hidden_dim, self.successor_dim),
+            )
+
+    def _make_head(self, hidden_dim: int, output_dim: int) -> nn.Module:
+        return nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.Mish(),
-            nn.Linear(hidden_dim, self.successor_dim),
+            nn.Linear(hidden_dim, int(output_dim)),
         )
+
+    def _build_state_group_indices(self):
+        if self.state_dim % self.observation_history_num != 0:
+            return list(range(self.state_dim)), [], []
+
+        single_state_dim = self.state_dim // self.observation_history_num
+        if single_state_dim < 27:
+            return list(range(self.state_dim)), [], []
+
+        object_indices = []
+        eef_finger_indices = []
+        other_state_indices = []
+        for hist_idx in range(self.observation_history_num):
+            offset = hist_idx * single_state_dim
+            object_indices.extend(range(offset, offset + 14))
+            eef_finger_indices.extend(range(offset + 14, offset + 27))
+            if single_state_dim > 27:
+                other_state_indices.extend(range(offset + 27, offset + single_state_dim))
+        return object_indices, eef_finger_indices, other_state_indices
 
     def _current_features(
         self,
@@ -127,9 +193,32 @@ class GroundTruthDynamicsModel(nn.Module):
             common,
             action_eval,
         )## s：(state,qpose)
-        prediction = self.transition(features)
-        state_prediction = prediction[:, :self.state_dim]
-        qpos_prediction = prediction[:, self.state_dim:]
+        if self.split_heads:
+            hidden = self.transition_trunk(features)
+            state_prediction = features.new_zeros((features.shape[0], self.state_dim))
+            if self.object_indices.numel() > 0:
+                state_prediction.index_copy_(
+                    -1,
+                    self.object_indices,
+                    self.object_head(hidden),
+                )
+            if self.eef_finger_indices.numel() > 0:
+                state_prediction.index_copy_(
+                    -1,
+                    self.eef_finger_indices,
+                    self.eef_finger_head(hidden),
+                )
+            if self.other_state_head is not None and self.other_state_indices.numel() > 0:
+                state_prediction.index_copy_(
+                    -1,
+                    self.other_state_indices,
+                    self.other_state_head(hidden),
+                )
+            qpos_prediction = self.qpos_head(hidden)
+        else:
+            prediction = self.transition(features)
+            state_prediction = prediction[:, :self.state_dim]
+            qpos_prediction = prediction[:, self.state_dim:]
         if self.predict_delta:
             next_state = current_state + state_prediction
             next_qpos = current_qpos + qpos_prediction

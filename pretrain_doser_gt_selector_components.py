@@ -75,6 +75,11 @@ DEFAULT_PRETRAIN_CFG = {
     "dynamics_image_feat_dim": 64,
     "dynamics_pcd_feat_dim": 64,
     "predict_delta": True,
+    "dynamics_split_heads": False,
+    "dynamics_group_loss": False,
+    "dynamics_object_loss_weight": 1.0,
+    "dynamics_eef_finger_loss_weight": 1.0,
+    "dynamics_other_state_loss_weight": 1.0,
     "split_action_detectors": False,
     "action_loss_weight": 1.0,
     "dynamics_loss_weight": 1.0,
@@ -165,6 +170,8 @@ def _build_components(dims: Dict, cfg, device: torch.device):
         image_shape=dims["image_shape"],
         image_feat_dim=cfg.dynamics_image_feat_dim,
         predict_delta=cfg.predict_delta,
+        split_heads=cfg.dynamics_split_heads,
+        observation_history_num=dims.get("observation_history_num", 1),
     ).to(device)
     state_detector = GroundTruthStateDetector(
         latent_dim=dims["state_dim"] + dims["qpos_dim"],
@@ -227,6 +234,46 @@ def _action_denoising_loss(model, common, action_eval, action_detector, cfg):
     return 0.5 * (loss_A + loss_B)
 
 
+def _select_state_group(state: torch.Tensor, group_names, observation_history_num: int):
+    groups = _state_group_indices(state.shape[-1], observation_history_num)
+    indices = []
+    for name in group_names:
+        indices.extend(groups.get(name, []))
+    if len(indices) == 0:
+        return state.new_zeros((state.shape[0], 0))
+    index = torch.as_tensor(indices, device=state.device, dtype=torch.long)
+    return state.index_select(-1, index)
+
+
+def _dynamics_group_losses(model, pred_next_state, next_state, pred_next_qpos, next_qpos):
+    history = getattr(model, "observation_history_num", 1)
+    object_pred = _select_state_group(pred_next_state, ("object",), history)
+    object_target = _select_state_group(next_state, ("object",), history)
+    eef_finger_pred = _select_state_group(pred_next_state, ("eef", "finger"), history)
+    eef_finger_target = _select_state_group(next_state, ("eef", "finger"), history)
+    other_pred = _select_state_group(pred_next_state, ("other",), history)
+    other_target = _select_state_group(next_state, ("other",), history)
+    losses = {
+        "object": (
+            F.mse_loss(object_pred, object_target)
+            if object_pred.shape[-1] > 0
+            else pred_next_state.new_zeros(())
+        ),
+        "eef_finger": (
+            F.mse_loss(eef_finger_pred, eef_finger_target)
+            if eef_finger_pred.shape[-1] > 0
+            else pred_next_state.new_zeros(())
+        ),
+        "other": (
+            F.mse_loss(other_pred, other_target)
+            if other_pred.shape[-1] > 0
+            else pred_next_state.new_zeros(())
+        ),
+        "qpos": F.mse_loss(pred_next_qpos, next_qpos),
+    }
+    return losses
+
+
 def _train_components(model, loader, components, cfg, device):
     action_detector, dynamics_model, state_detector, value_net = components
     _set_trainable(action_detector, True)
@@ -284,10 +331,33 @@ def _train_components(model, loader, components, cfg, device):
                 dynamics_out["next_qpos"],
                 next_qpos,
             )
-            dynamics_loss = (
-                float(cfg.dynamics_state_loss_weight) * dynamics_state_loss
-                + float(cfg.dynamics_qpos_loss_weight) * dynamics_qpos_loss
-            )
+            if bool(cfg.dynamics_group_loss):
+                dynamics_part_losses = _dynamics_group_losses(
+                    model,
+                    dynamics_out["next_state"],
+                    next_state,
+                    dynamics_out["next_qpos"],
+                    next_qpos,
+                )
+                dynamics_loss = (
+                    float(cfg.dynamics_state_loss_weight)
+                    * (
+                        float(cfg.dynamics_object_loss_weight)
+                        * dynamics_part_losses["object"]
+                        + float(cfg.dynamics_eef_finger_loss_weight)
+                        * dynamics_part_losses["eef_finger"]
+                        + float(cfg.dynamics_other_state_loss_weight)
+                        * dynamics_part_losses["other"]
+                    )
+                    + float(cfg.dynamics_qpos_loss_weight)
+                    * dynamics_part_losses["qpos"]
+                )
+            else:
+                dynamics_part_losses = None
+                dynamics_loss = (
+                    float(cfg.dynamics_state_loss_weight) * dynamics_state_loss
+                    + float(cfg.dynamics_qpos_loss_weight) * dynamics_qpos_loss
+                )
             with torch.no_grad():
                 q1, q2 = model.critic_target(
                     common["pcd"],
@@ -323,6 +393,14 @@ def _train_components(model, loader, components, cfg, device):
                 dyn=f"{float(dynamics_loss.detach().item()):.4f}",
                 dyn_state=f"{float(dynamics_state_loss.detach().item()):.4f}",
                 dyn_qpos=f"{float(dynamics_qpos_loss.detach().item()):.4f}",
+                dyn_obj=(
+                    f"{float(dynamics_part_losses['object'].detach().item()):.4f}"
+                    if dynamics_part_losses is not None else "-"
+                ),
+                dyn_eef_finger=(
+                    f"{float(dynamics_part_losses['eef_finger'].detach().item()):.4f}"
+                    if dynamics_part_losses is not None else "-"
+                ),
                 state=f"{float(state_loss.detach().item()):.4f}",
                 value=f"{float(value_loss.detach().item()):.4f}",
             )
@@ -633,6 +711,7 @@ def _save(cfg, pre_cfg, dims, components, reference_errors, metrics):
         "format_version": 2,
         "selector_type": "ground_truth_state",
         "successor_dim": int(dims["state_dim"] + dims["qpos_dim"]),
+        "observation_history_num": int(dims.get("observation_history_num", 1)),
         "detector_hidden_dim": int(pre_cfg.detector_hidden_dim),
         "dynamics_hidden_dim": int(pre_cfg.dynamics_hidden_dim),
         "value_hidden_dim": int(pre_cfg.value_hidden_dim),
@@ -643,6 +722,7 @@ def _save(cfg, pre_cfg, dims, components, reference_errors, metrics):
         "dynamics_image_feat_dim": int(pre_cfg.dynamics_image_feat_dim),
         "dynamics_pcd_feat_dim": int(pre_cfg.dynamics_pcd_feat_dim),
         "predict_delta": bool(pre_cfg.predict_delta),
+        "dynamics_split_heads": bool(pre_cfg.dynamics_split_heads),
         "value_subgoal_dim": int(value_net.subgoal_dim),
         "max_train_episodes": demo_count,
         "action_detector_mode": "branch" if split_action_detectors else "shared",
@@ -719,6 +799,7 @@ def main(cfg):
     model.requires_grad_(False)
 
     dims = _infer_dims(model, train_loader, device)
+    dims["observation_history_num"] = int(getattr(model, "observation_history_num", 1))
     components = _build_components(dims, pre_cfg, device)
     # Fixed state/qpos coordinates allow all four independent modules to train
     # in one pass over the dataset.

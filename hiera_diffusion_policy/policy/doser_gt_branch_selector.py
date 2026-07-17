@@ -103,6 +103,8 @@ class GroundTruthDoserBranchSelector(DoserBranchSelector):
             image_shape=image_shape,
             image_feat_dim=metadata["dynamics_image_feat_dim"],
             predict_delta=metadata["predict_delta"],
+            split_heads=metadata.get("dynamics_split_heads", False),
+            observation_history_num=metadata.get("observation_history_num", 1),
         )
         state_detector = GroundTruthStateDetector(
             latent_dim=successor_dim,
