@@ -406,6 +406,10 @@ class TrainWorkspace(BaseWorkspace):
             # ********** 训练actor **********
             # training loop
             next_actions = None
+            # Defaults to the historical behavior for every existing config.  New
+            # BC-only / test-time-guidance runs can disable costly intermediate
+            # environment rollouts without maintaining a second workspace.
+            enable_actor_rollout = bool(cfg.training.get('enable_actor_rollout', True))
             with JsonLogger(log_path) as json_logger:
                 # ************ 遍历epoch开始训练 ************
                 for local_epoch_idx in range(cfg.training.num_epochs):
@@ -526,7 +530,7 @@ class TrainWorkspace(BaseWorkspace):
 
                     # run rollout
                     # ************ 在仿真环境中测试 ************
-                    if (self.epoch_actor % cfg.training.rollout_every) == 0:
+                    if enable_actor_rollout and (self.epoch_actor % cfg.training.rollout_every) == 0:
                     ## if (self.epoch_actor > 0) and ((self.epoch_actor % cfg.training.rollout_every) == 0):
                         runner_log = env_runner.run(self.model)
                         step_log.update(runner_log)
@@ -639,5 +643,12 @@ class TrainWorkspace(BaseWorkspace):
                     json_logger.log(step_log)
                     self.global_step_actor += 1
                     self.epoch_actor += 1
+
+            # Periodic checkpointing may not coincide with the last epoch.  Keep
+            # actor_latest as the final trained actor for all actor-stage runs.
+            if cfg.checkpoint.save_last_ckpt:
+                self.save_checkpoint(tag='actor_latest')
+            if cfg.checkpoint.save_last_snapshot:
+                self.save_snapshot(tag='actor_latest')
     
         wandb.finish()

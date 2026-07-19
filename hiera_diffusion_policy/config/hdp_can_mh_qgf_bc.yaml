@@ -1,0 +1,29 @@
+# Actor_BC training for the QGF-on-HDP experiment.
+# Inherits every architecture and dataset setting from hdp_can_mh.yaml, while
+# avoiding any change to the original HDP configuration.
+defaults:
+  - hdp_can_mh
+  - _self_
+
+name: hdp_qgf_actor_bc
+name_remark: qgf_actor_bc
+
+logging:
+  name: can_mh_qgf_bc_seed${training.seed}
+
+# Supply this on the command line (or replace null here) with the pre-trained
+# original HDP guider checkpoint.  Critic loading is unnecessary for BC training
+# and is intentionally deferred to the test-time-guidance evaluation stage.
+guider_path: null
+critic_path: null
+actor_path: null
+
+# Actor_BC must be trained exclusively with the diffusion behavioral-cloning loss.
+eta: 0.0
+policy:
+  eta: ${eta}
+
+training:
+  # The generic workspace treats an omitted key as true, preserving every older
+  # config.  This experiment trains first and evaluates later.
+  enable_actor_rollout: false
