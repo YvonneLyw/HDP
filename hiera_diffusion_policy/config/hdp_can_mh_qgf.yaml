@@ -1,0 +1,45 @@
+# Unified QGF-on-HDP configuration.
+#
+# Use this same config for:
+#   1) Actor_BC training via train_hdp_actor_bc.py (mode=none, eta=0), and
+#   2) evaluation via eval_hdp.py (mode=none/noisy/clean with checkpoints).
+defaults:
+  - hdp_can_mh
+  - _self_
+
+name: hdp_qgf
+name_remark: qgf
+
+logging:
+  name: can_mh_qgf_seed${training.seed}_${name_remark}
+
+# Set these explicitly from the command line for training/evaluation.
+guider_path: null
+critic_path: null
+actor_path: null
+
+# Actor_BC is pure diffusion behavioral cloning.  eta is irrelevant during
+# eval_hdp.py rollout, but retaining zero makes the shared config safe to train.
+eta: 0.0
+
+# The original MH-HDP actor, guider, and critic all condition on the object
+# point cloud.  Actor_BC must use this same architecture to be comparable.
+use_pcd: true
+
+policy:
+  _target_: hiera_diffusion_policy.policy.hiera_diffusion_policy_qgf.HieraDiffusionPolicyQGF
+  eta: ${eta}
+  # none: BC control; noisy: Q(x_t); clean: Q(pred_original_sample)
+  q_guidance_mode: none
+  # The policy forcibly uses 0.0 whenever mode=none.  Keeping the default at
+  # 1.0 makes a noisy/clean override enable the nominal guidance strength.
+  q_guidance_weight: 1.0
+  # posterior_variance implements the DDPM reverse-mean guidance scale.
+  q_guidance_scale: posterior_variance
+  # Optional per-sample full-trajectory L2 clipping.  Keep the same setting for
+  # noisy and clean comparisons; null means no clipping.
+  q_guidance_grad_clip_norm: null
+
+training:
+  # Do not evaluate during Actor_BC training.  All rollouts use eval_hdp.py.
+  enable_actor_rollout: false
