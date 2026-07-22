@@ -55,11 +55,26 @@ class TrainWorkspace(BaseWorkspace):
         model_guider = hydra.utils.instantiate(cfg.model_guider)
         model_actor = hydra.utils.instantiate(cfg.model_actor)
         model_critic = hydra.utils.instantiate(cfg.model_critic)
-        self.model:HieraDiffusionPolicy = hydra.utils.instantiate(cfg.policy, 
-                                             guider=model_guider,
-                                             actor=model_actor,
-                                             critic=model_critic,
-                                             )
+        critic_training_mode = str(cfg.get('critic_training_mode', 'td')).lower()
+        use_iql_value = (
+            cfg.train_model == 'critic_iql' or critic_training_mode == 'iql'
+        )
+        model_value = None
+        if use_iql_value:
+            if cfg.get('model_value') is None:
+                raise ValueError("critic_iql requires model_value in the config")
+            model_value = hydra.utils.instantiate(cfg.model_value)
+
+        policy_kwargs = dict(
+            guider=model_guider,
+            actor=model_actor,
+            critic=model_critic,
+        )
+        if model_value is not None:
+            policy_kwargs['value'] = model_value
+        self.model:HieraDiffusionPolicy = hydra.utils.instantiate(
+            cfg.policy, **policy_kwargs
+        )
 
         # configure training state
         self.optimizer_guider = hydra.utils.instantiate(cfg.optimizer_guider, params=self.model.guider.parameters())
@@ -70,6 +85,12 @@ class TrainWorkspace(BaseWorkspace):
             params=self.model.get_actor_training_parameters()
         )
         self.optimizer_critic = hydra.utils.instantiate(cfg.optimizer_critic, params=self.model.critic.parameters())
+        self.optimizer_value = None
+        if model_value is not None:
+            self.optimizer_value = hydra.utils.instantiate(
+                cfg.optimizer_value,
+                params=self.model.value.parameters(),
+            )
 
         self.global_step_guider = 0
         self.global_step_critic = 0
@@ -141,6 +162,15 @@ class TrainWorkspace(BaseWorkspace):
             num_training_steps=cfg.training.num_steps,
             last_epoch=self.global_step_critic-1
         )
+        lr_scheduler_value = None
+        if self.optimizer_value is not None:
+            lr_scheduler_value = get_scheduler(
+                cfg.training.lr_scheduler,
+                optimizer=self.optimizer_value,
+                num_warmup_steps=cfg.training.lr_warmup_steps,
+                num_training_steps=cfg.training.num_steps,
+                last_epoch=self.global_step_critic-1,
+            )
         lr_scheduler_actor = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer_actor,
@@ -400,6 +430,133 @@ class TrainWorkspace(BaseWorkspace):
                     json_logger.log(step_log)
                     self.global_step_critic += 1
                     self.epoch_critic += 1
+
+
+        if cfg.train_model == 'critic_iql':
+            if self.optimizer_value is None or lr_scheduler_value is None:
+                raise RuntimeError(
+                    "critic_iql requires an instantiated Value network and optimizer_value"
+                )
+
+            # IQL keeps the actor and guider fixed.  Q and V have independent
+            # optimizers; their targets are deliberately detached inside the
+            # policy loss functions.
+            with JsonLogger(log_path) as json_logger:
+                while True:
+                    if self.global_step_critic >= cfg.training.num_steps:
+                        break
+
+                    step_log = dict()
+                    train_q_losses = list()
+                    train_v_losses = list()
+                    with tqdm.tqdm(
+                        train_dataloader,
+                        desc=f"Training IQL Critic - epoch {self.epoch_critic}",
+                        leave=False,
+                        mininterval=cfg.training.tqdm_interval_sec,
+                    ) as tepoch:
+                        for batch_idx, batch in enumerate(tepoch):
+                            if self.global_step_critic >= cfg.training.num_steps:
+                                break
+                            batch = dict_apply(
+                                batch,
+                                lambda x: x.to(device, non_blocking=True),
+                            )
+                            if train_sampling_batch is None:
+                                train_sampling_batch = batch
+
+                            q_loss, q_info = self.model.compute_loss_critic_iql(batch)
+                            v_loss, v_info = self.model.compute_loss_value_iql(batch)
+
+                            self.optimizer_critic.zero_grad()
+                            q_loss.backward()
+                            self.optimizer_critic.step()
+                            self.model.run_ema_critic()
+                            lr_scheduler_critic.step()
+
+                            self.optimizer_value.zero_grad()
+                            v_loss.backward()
+                            self.optimizer_value.step()
+                            lr_scheduler_value.step()
+
+                            q_loss_value = q_loss.item()
+                            v_loss_value = v_loss.item()
+                            train_q_losses.append(q_loss_value)
+                            train_v_losses.append(v_loss_value)
+                            tepoch.set_postfix(
+                                q_loss=q_loss_value,
+                                v_loss=v_loss_value,
+                                refresh=False,
+                            )
+
+                            step_log = {
+                                'train_loss_critic_iql_q': q_loss_value,
+                                'train_loss_critic_iql_v': v_loss_value,
+                                'q1_iql': q_info['q1'].item(),
+                                'q2_iql': q_info['q2'].item(),
+                                'target_q_iql': q_info['target_q'].item(),
+                                'next_v_iql': q_info['next_v'].item(),
+                                'q_min_iql': v_info['q_min'].item(),
+                                'v_iql': v_info['v'].item(),
+                                'advantage_iql': v_info['advantage'].item(),
+                                'advantage_positive_fraction_iql': v_info[
+                                    'advantage_positive_fraction'
+                                ].item(),
+                                'global_step_critic': self.global_step_critic,
+                                'epoch_critic': self.epoch_critic,
+                                'lr_critic': lr_scheduler_critic.get_last_lr()[0],
+                                'lr_value': lr_scheduler_value.get_last_lr()[0],
+                            }
+
+                            wandb_run.log(step_log, step=self.global_step_critic)
+                            json_logger.log(step_log)
+                            self.global_step_critic += 1
+
+                    if not train_q_losses:
+                        break
+                    step_log['train_loss_critic_iql_q'] = np.mean(train_q_losses)
+                    step_log['train_loss_critic_iql_v'] = np.mean(train_v_losses)
+
+                    if (self.epoch_critic % cfg.training.val_every) == 0:
+                        val_q_losses = list()
+                        val_v_losses = list()
+                        with torch.no_grad():
+                            with tqdm.tqdm(
+                                val_dataloader,
+                                desc=f"Validation IQL Critic - epoch {self.epoch_critic}",
+                                leave=False,
+                                mininterval=cfg.training.tqdm_interval_sec,
+                            ) as tepoch:
+                                for batch in tepoch:
+                                    batch = dict_apply(
+                                        batch,
+                                        lambda x: x.to(device, non_blocking=True),
+                                    )
+                                    q_loss, _ = self.model.compute_loss_critic_iql(batch)
+                                    v_loss, _ = self.model.compute_loss_value_iql(batch)
+                                    val_q_losses.append(q_loss.item())
+                                    val_v_losses.append(v_loss.item())
+                        if val_q_losses:
+                            step_log['val_loss_critic_iql_q'] = np.mean(val_q_losses)
+                            step_log['val_loss_critic_iql_v'] = np.mean(val_v_losses)
+
+                    if (self.epoch_critic % cfg.training.checkpoint_every) == 0:
+                        if cfg.checkpoint.save_last_ckpt:
+                            self.save_checkpoint(tag='critic_latest')
+                        if cfg.checkpoint.save_last_snapshot:
+                            self.save_snapshot(tag='critic_latest')
+
+                    log_step = max(0, self.global_step_critic - 1)
+                    wandb_run.log(step_log, step=log_step)
+                    json_logger.log(step_log)
+                    self.epoch_critic += 1
+
+            # Unlike the historical TD critic loop, an IQL run always preserves
+            # the final Q/EMA pair even if num_steps is not an epoch multiple.
+            if cfg.checkpoint.save_last_ckpt:
+                self.save_checkpoint(tag='critic_latest')
+            if cfg.checkpoint.save_last_snapshot:
+                self.save_snapshot(tag='critic_latest')
 
 
         if cfg.train_model == 'actor':

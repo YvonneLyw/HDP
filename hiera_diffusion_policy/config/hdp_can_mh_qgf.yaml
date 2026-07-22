@@ -26,6 +26,45 @@ eta: 0.0
 # point cloud.  Actor_BC must use this same architecture to be comparable.
 use_pcd: true
 
+# TD remains the default for all existing QGF training/evaluation commands.
+# The dedicated IQL entry point switches this to ``iql`` and trains only Q/V.
+critic_training_mode: td
+
+iql:
+  expectile: 0.9
+  # Keep the original HDP critic's one-discount target for the first TD-vs-IQL
+  # comparison.  The dataset transition is t -> t+Tr, so gamma^Tr belongs in a
+  # separately labelled discount-semantics ablation.
+  discount_exponent: 1
+  # Preserve HDP's current-action noise augmentation for L_Q.  L_V always uses
+  # clean dataset actions regardless of this setting.
+  use_hdp_action_noise: true
+
+model_value:
+  _target_: hiera_diffusion_policy.model.diffusion.value.Value
+  pcd_encoder:
+    _target_: hiera_diffusion_policy.model.diffusion.pointcloud_encoder.PointNetEncoder
+    input_dim: 6
+    mlp_dims:
+    - 64
+    - 128
+    - 256
+  state_dim: 54
+  subgoal_dim: ${subgoal_dim}
+  mlp_dims:
+  - 512
+  - 256
+  - 128
+
+optimizer_value:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.95
+  - 0.999
+  eps: 1.0e-08
+  lr: 0.001
+  weight_decay: 1.0e-06
+
 policy:
   _target_: hiera_diffusion_policy.policy.hiera_diffusion_policy_qgf.HieraDiffusionPolicyQGF
   eta: ${eta}
@@ -39,6 +78,9 @@ policy:
   # Optional per-sample full-trajectory L2 clipping.  Keep the same setting for
   # noisy and clean comparisons; null means no clipping.
   q_guidance_grad_clip_norm: null
+  iql_expectile: ${iql.expectile}
+  iql_discount_exponent: ${iql.discount_exponent}
+  iql_use_hdp_action_noise: ${iql.use_hdp_action_noise}
 
 training:
   # Do not evaluate during Actor_BC training.  All rollouts use eval_hdp.py.
