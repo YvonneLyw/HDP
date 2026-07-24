@@ -78,6 +78,10 @@ policy:
   # Optional per-sample full-trajectory L2 clipping.  Keep the same setting for
   # noisy and clean comparisons; null means no clipping.
   q_guidance_grad_clip_norm: null
+  # Best-of-N / BFN: independently sample N complete trajectories under the
+  # same condition, then execute the one with highest min(Q1, Q2).  N=1 is
+  # exactly the existing sampler; N=4 is the 6b setting.
+  bfn_num_samples: 1
   iql_expectile: ${iql.expectile}
   iql_discount_exponent: ${iql.discount_exponent}
   iql_use_hdp_action_noise: ${iql.use_hdp_action_noise}

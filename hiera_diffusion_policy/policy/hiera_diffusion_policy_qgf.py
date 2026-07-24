@@ -34,6 +34,7 @@ class HieraDiffusionPolicyQGF(HieraDiffusionPolicy):
         q_guidance_weight: float = 1.0,
         q_guidance_scale: str = "posterior_variance",
         q_guidance_grad_clip_norm: Optional[float] = None,
+        bfn_num_samples: int = 1,
         value=None,
         iql_expectile: float = 0.9,
         iql_discount_exponent: int = 1,
@@ -50,6 +51,9 @@ class HieraDiffusionPolicyQGF(HieraDiffusionPolicy):
             if q_guidance_grad_clip_norm is None
             else float(q_guidance_grad_clip_norm)
         )
+        # Best-of-N (BFN) is inference-only: generate this many independent
+        # full trajectories per condition, then retain the highest-Q one.
+        self.bfn_num_samples = int(bfn_num_samples)
         # Value is absent in TD-Q and all ordinary QGF evaluations.  It is
         # supplied only by the dedicated IQL-critic training stage.
         self.value = value
@@ -69,6 +73,8 @@ class HieraDiffusionPolicyQGF(HieraDiffusionPolicy):
             )
         if self.q_guidance_weight < 0.0:
             raise ValueError("q_guidance_weight must be non-negative")
+        if self.bfn_num_samples <= 0:
+            raise ValueError("bfn_num_samples must be a positive integer")
         if not 0.0 < self.iql_expectile < 1.0:
             raise ValueError("iql_expectile must lie strictly between 0 and 1")
         if self.iql_discount_exponent <= 0:
@@ -318,6 +324,36 @@ class HieraDiffusionPolicyQGF(HieraDiffusionPolicy):
             variance = torch.as_tensor(variance)
         return variance.to(device=action.device, dtype=action.dtype)
 
+    @staticmethod
+    def _repeat_for_bfn(tensor: Optional[torch.Tensor], num_samples: int):
+        """Repeat each batch element consecutively for best-of-N sampling."""
+        if tensor is None or num_samples == 1:
+            return tensor
+        return tensor.repeat_interleave(num_samples, dim=0)
+
+    # 最终 Q 打分 a0_pred
+    def _score_final_actions(
+        self,
+        pcd: Optional[torch.Tensor],
+        state: torch.Tensor,
+        subgoal: Optional[torch.Tensor],
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return min(Q1, Q2) for fully denoised normalized action sequences.
+
+        This is deliberately a separate, gradient-free Q query.  Per-step Q
+        calls steer each candidate during diffusion; BFN only ranks candidates
+        after every reverse DDPM step has completed.
+        """
+        with torch.no_grad():
+            q1, q2 = self.critic_target(
+                pcd,
+                state,
+                subgoal,
+                self._critic_action_slice(action),
+            )
+            return torch.minimum(q1, q2)
+
     def conditional_sample_action(
         self,
         pcd,
@@ -326,16 +362,16 @@ class HieraDiffusionPolicyQGF(HieraDiffusionPolicy):
         action_init=None,
         model: Actor = None,
     ):
-        """Sample an action sequence and optionally guide every reverse DDPM step.
+        """Sample an action sequence, optionally guide it, then optionally BFN-rank it.
 
-        Guidance is inference-only.  When ``model`` is supplied by a training
-        path, or mode is ``none``, the original HDP sampler is used unchanged.
+        ``bfn_num_samples`` is applied once per environment control cycle, not
+        once per DDPM timestep.  The same condition is repeated N times, all N
+        trajectories finish their entire reverse process independently, and
+        only then does the target critic select the best final action sequence.
+        ``model`` denotes a training-time actor and must never enter BFN.
         """
-        if (
-            model is not None
-            or self.q_guidance_mode == "none"   # q_guidance_enabled
-            or self.q_guidance_weight <= 0.0    
-        ):   
+        # 绕过 BFN，原 HDP sampler：actor/critic 训练流程不受影响########################
+        if model is not None:
             return super().conditional_sample_action(
                 pcd=pcd,
                 state=state,
@@ -343,32 +379,88 @@ class HieraDiffusionPolicyQGF(HieraDiffusionPolicy):
                 action_init=action_init,
                 model=model,
             )
-
+        ###################################### 开BFN ##################################
         batch_size = state.shape[0]
-        action = torch.randn(
-            size=(batch_size, self.horizon, self.action_dim),
-            dtype=self.dtype,
-            device=self.device,
-        )
+        # 4 条 candidate：observation、point cloud、state、subgoal 完全一样
+        num_samples = self.bfn_num_samples  # 4
+        candidate_pcd = self._repeat_for_bfn(pcd, num_samples)
+        candidate_state = self._repeat_for_bfn(state, num_samples)
+        candidate_subgoal = self._repeat_for_bfn(subgoal, num_samples)
+        candidate_action_init = self._repeat_for_bfn(action_init, num_samples)
 
-        for timestep in self.noise_scheduler_actor.timesteps:
-            # The actor and DDPM base transition stay outside the autograd graph.
-            with torch.no_grad():
-                action_noise = self.actor_target(pcd, state, subgoal, action, timestep)
-                step_output = self.noise_scheduler_actor.step(
-                    action_noise, timestep, action, generator=None
+        # QGF（q_guidance）的 noisy/clean 模式
+        guidance_active = (
+            self.q_guidance_mode != "none" and self.q_guidance_weight > 0.0
+        )   
+        if not guidance_active:     ########### 不开QGF #############
+            # With N=1 this is exactly the original Actor_BC sampler.  With
+            # N>1 it provides the required BC-only + BFN control: the final Q
+            # ranking still occurs below, but no per-step Q gradient is used.
+            action = super().conditional_sample_action(
+                pcd=candidate_pcd,
+                state=candidate_state,
+                subgoal=candidate_subgoal,
+                action_init=candidate_action_init,  # 4个相同的 action 但父类也会生成随机
+                model=None,
+            )
+        else:                       ########### 开QGF #############
+            action = torch.randn(
+                size=(batch_size * num_samples, self.horizon, self.action_dim),
+                dtype=self.dtype,
+                device=self.device,
+            )                                   # 4个不同的 action 
+
+            for timestep in self.noise_scheduler_actor.timesteps:   # t 从T～0 
+                # The actor and DDPM base transition stay outside the autograd graph.
+                with torch.no_grad():
+                    action_noise = self.actor_target(                           # A_BC -> noise
+                        candidate_pcd,
+                        candidate_state,
+                        candidate_subgoal,
+                        action,
+                        timestep,
+                    )
+                    step_output = self.noise_scheduler_actor.step(
+                        action_noise, timestep, action, generator=None
+                    )                                                           # DDPM -> x_0_pred
+                    base_prev_action = step_output.prev_sample                         # x_{t-1}^{BC}
+                    
+                    if self.q_guidance_mode == "clean":                         # q_gradient在 clean/noisy 模式
+                        action_for_q = step_output.pred_original_sample  # x_hat_0
+                    else:  # noisy: query Q directly on x_t (the OOD-gradient ablation)
+                        action_for_q = action
+
+                # Each candidate gets its own guidance gradient.  Candidates
+                # are never pruned or compared within the DDPM loop.
+                q_gradient = self._q_gradient(                                   
+                    candidate_pcd,
+                    candidate_state,
+                    candidate_subgoal,
+                    action_for_q,
                 )
-                base_prev_action = step_output.prev_sample          # x_t-1
-                if self.q_guidance_mode == "clean":
-                    action_for_q = step_output.pred_original_sample # x0_prev
-                else:  # noisy: query Q directly on x_t (the OOD-gradient ablation)
-                    action_for_q = action                           # x_t
-
-            # clean mode uses dQ/d(x_hat_0) as an approximation to dQ/d(x_t),
-            # i.e. d(x_hat_0)/d(x_t) is replaced by the identity.
-            q_gradient = self._q_gradient(pcd, state, subgoal, action_for_q)
-            q_gradient = self._clip_gradient(q_gradient)
-            scale = self._guidance_step_scale(timestep, action)
-            action = base_prev_action + self.q_guidance_weight * scale * q_gradient
-
-        return action
+                q_gradient = self._clip_gradient(q_gradient)
+                scale = self._guidance_step_scale(timestep, action)
+                action = base_prev_action + self.q_guidance_weight * scale * q_gradient 
+                                                                                # a_0_pred
+        if num_samples == 1:
+            return action
+        ############################### 开BFN 对于4个 action的选择 ########################
+        # QGF-style best-of-N selection: score only fully denoised candidates
+        # with the frozen EMA target critic and keep one per original condition.
+        final_q = self._score_final_actions(
+            candidate_pcd,
+            candidate_state,
+            candidate_subgoal,
+            action,
+        ).reshape(batch_size, num_samples)
+        candidate_actions = action.reshape(
+            batch_size,
+            num_samples,
+            self.horizon,
+            self.action_dim,
+        )
+        best_index = final_q.argmax(dim=1)
+        return candidate_actions[
+            torch.arange(batch_size, device=action.device),
+            best_index,
+        ]
