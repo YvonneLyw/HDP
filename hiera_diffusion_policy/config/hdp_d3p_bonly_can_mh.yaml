@@ -1,0 +1,17 @@
+# B-only D3P on the Robomimic Can MH demonstrations.
+# Keep every B-only modelling/training setting identical to the PH config;
+# only switch the task-specific dataset and rollout environment.
+defaults:
+  - hdp_d3p_bonly_can_ph
+  - _self_
+
+logging:
+  name: can_mh_d3p_bonly_seed${training.seed}_${name_remark}
+
+task:
+  dataset:
+    dataset_path: data/robomimic/datasets/can/mh/image_abs_pcd.hdf5
+  dataset_path: data/robomimic/datasets/can/mh/image_abs_pcd.hdf5
+  dataset_type: mh
+  env_runner:
+    dataset_path: data/robomimic/datasets/can/mh/image_abs_pcd.hdf5
