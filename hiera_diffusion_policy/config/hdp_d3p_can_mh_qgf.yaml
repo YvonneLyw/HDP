@@ -1,0 +1,16 @@
+# Isolated QGF-on-Fusion experiment.  The base hdp_d3p_can_mh.yaml and its
+# HieraDiffusionPolicyD3PFusion implementation remain unchanged.
+defaults:
+  - hdp_d3p_can_mh
+  - _self_
+
+name: train_hdp_d3p_fusion_qgf
+
+policy:
+  _target_: hiera_diffusion_policy.policy.hiera_diffusion_policy_d3p_fusion_qgf.HieraDiffusionPolicyD3PFusionQGF
+  # Applied only to B2 during rollout.  `none` delegates to the original
+  # Fusion sampler exactly, so it is the matched no-QGF control.
+  b2_q_guidance_mode: none          # none / noisy / clean
+  b2_q_guidance_weight: 1.0
+  b2_q_guidance_scale: posterior_variance   # posterior_variance / constant
+  b2_q_guidance_grad_clip_norm: null
