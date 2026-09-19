@@ -1,3 +1,17 @@
+# HDP 几何与视觉双分支项目
+
+本项目研究机器人在观测不准确或偏离示范的情况下，如何生成和选择相对可靠的动作。我们以 Hierarchical Diffusion Policy（HDP）为基础，保留高层接触子目标引导，在低层使用几何与视觉两种条件生成动作候选，并探索它们之间的选择方法。
+
+初次接触项目，建议先读 **[项目导读：我们在做什么，以及从哪里开始看](docs/GETTING_STARTED_ZH.md)**。它按以下主线介绍项目：
+
+**原版 HDP 的分层结构 → 借鉴 D3P 的几何/视觉双分支 → DOSER 等候选选择方法。**
+
+先理解模块关系，再从原版 HDP 论文与代码入手，逐步阅读本项目的融合部分。仓库保留了不同研究阶段的实现，具体参数可以在读到相应代码时查阅[模式与开关速查](docs/MODES_ZH.md)。
+
+以下保留原版 HDP 的介绍、安装说明与引用，作为背景资料。
+
+---
+
 # Hierarchical Diffusion Policy
 
 Hierarchical Diffusion Policy: Manipulation Trajectory Generation Via Contact Guidance
